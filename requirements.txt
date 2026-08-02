@@ -1,0 +1,6 @@
+# Laptop frontend runtime for main.py.
+# Tkinter is provided by the Python distribution/system package, not pip.
+fastapi==0.115.12
+uvicorn==0.34.0
+paramiko==3.5.0
+pyinstaller==6.11.1
