@@ -62,6 +62,62 @@ BOOL_ENV_KEYS = {
     "REQUIRE_VALID_FORMAT",
 }
 
+# ---------------------------------------------------------------------------
+# Fabricated results for --debug (frontend demo only, never used in live mode).
+# Numbers are hand-picked to stay self-consistent: student < teacher everywhere,
+# retention = student_baseline / teacher_baseline ~= 0.785.
+# ---------------------------------------------------------------------------
+SIM_CONTROL_ACCURACY: dict[str, tuple[float, float]] = {
+    # control name: (teacher accuracy, student accuracy)
+    "baseline": (0.8140, 0.6390),
+    "text_only_blank": (0.4620, 0.4050),
+    "hint_ablation": (0.7580, 0.5720),
+    "option_shuffle": (0.7930, 0.6010),
+    "random_image_swap": (0.6210, 0.5240),
+    "image_blur": (0.7350, 0.5610),
+    "image_downsample": (0.7710, 0.5880),
+}
+
+SIM_REASON_SUMMARY: dict[str, str] = {
+    "n": "120",
+    "stage2_reason_score": "3.4200",
+    "stage3_reason_score": "3.8600",
+    "delta_reason_score": "0.4400",
+    "stage2_win_rate": "0.5750",
+}
+
+SIM_WATERMARK_REPORT: dict[str, Any] = {
+    "num_scored": 96,
+    "num_total_records": 480,
+    "split": "test",
+    "metrics": {
+        "mean_z": 4.8130,
+        "median_z": 4.6540,
+        "min_z": 1.2870,
+        "max_z": 9.4120,
+        "threshold_4_rate": 0.6420,
+    },
+}
+
+
+def _sim_control_suite(index: int) -> dict[str, Any]:
+    """Shape a fake control-suite result file the way the real scripts write it."""
+    summary = {name: {"accuracy": scores[index]} for name, scores in SIM_CONTROL_ACCURACY.items()}
+    return {
+        "metrics": {
+            "baseline_accuracy": SIM_CONTROL_ACCURACY["baseline"][index],
+            "control_summary": summary,
+        }
+    }
+
+
+def sim_teacher_result() -> dict[str, Any]:
+    return _sim_control_suite(0)
+
+
+def sim_student_result() -> dict[str, Any]:
+    return _sim_control_suite(1)
+
 
 def _startup_base_dir() -> Path:
     if getattr(sys, "frozen", False):
@@ -357,6 +413,9 @@ class WebConsole:
         self.real_pipeline_progress = 0.0
         self.pipeline_task: dict[str, Any] | None = None
         self.pipeline_started = False
+        # debug only: step ids whose simulation has finished, so the dashboard /
+        # watermark endpoints know which fabricated numbers may be revealed.
+        self.sim_completed: set[str] = set()
         self.save_app_config()
 
     def snapshot(self) -> dict[str, Any]:
@@ -929,6 +988,8 @@ class WebConsole:
             else:
                 status = "running"
                 progress = min(1.0, local_elapsed / per_step)
+            if status == "success":
+                self.sim_completed.add(step_id)
             rows.append({"id": step_id, "stage": label, "status": status, "progress": f"{progress * 100:.0f}%", "script": script})
         running = total_progress < 1.0
         summary = "完整 Pipeline 仿真完成：100%" if not running else f"完整 Pipeline 仿真运行中：{total_progress * 100:.0f}%"
@@ -946,6 +1007,13 @@ class WebConsole:
             "local_log_path": "",
         }
 
+    def sim_sync_completed(self) -> set[str]:
+        """Refresh (and return) the set of finished simulated steps."""
+        with self.lock:
+            if self.pipeline_task is not None:
+                self.sim_pipeline_status_locked()   # side effect: fills self.sim_completed
+            return set(self.sim_completed)
+
     def resolve_reason_out_dir(self) -> str:
         out_dir = str(self.console_vars.get("reason_out_dir", "")).strip() or "outputs/judge_latest"
         if out_dir.startswith("/"):
@@ -961,7 +1029,11 @@ class WebConsole:
         with self.lock:
             input_json = str(self.console_vars.get("watermark_input_json", "")).strip()
         output_path = self.watermark_output_path()
-        report = self.read_json_result(output_path)
+        if self.debug:
+            done = "watermark_detect" in self.sim_sync_completed()
+            report: dict[str, Any] = dict(SIM_WATERMARK_REPORT) if done else {}
+        else:
+            report = self.read_json_result(output_path)
         metrics = report.get("metrics", {}) if isinstance(report, dict) else {}
         return {
             "ok": bool(metrics),
@@ -1016,7 +1088,17 @@ class WebConsole:
         values = lines[1].split("\t")
         return {key: values[idx] if idx < len(values) else "" for idx, key in enumerate(keys)}
 
+    def sim_dashboard_payload(self) -> dict[str, Any]:
+        """Reveal fabricated metrics as the matching simulated stages finish."""
+        done = self.sim_sync_completed()
+        teacher = sim_teacher_result() if "teacher_eval" in done else {}
+        student = sim_student_result() if "student_eval" in done else {}
+        reason = dict(SIM_REASON_SUMMARY) if "reason_judge" in done else {}
+        return self.format_dashboard(teacher, student, reason)
+
     def dashboard_payload(self) -> dict[str, Any]:
+        if self.debug:
+            return self.sim_dashboard_payload()
         try:
             with self.lock:
                 result_dir = str(self.console_vars.get("result_dir", ""))
@@ -1174,6 +1256,7 @@ INDEX_HTML = r"""
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;500;600;700;800&family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='6' fill='%232563eb'/%3E%3Ccircle cx='12' cy='12' r='7' stroke='rgba(255,255,255,.6)' stroke-width='1.4' fill='none'/%3E%3Ccircle cx='12' cy='12' r='3.5' stroke='rgba(255,255,255,.45)' stroke-width='1.2' fill='none'/%3E%3Ccircle cx='12' cy='12' r='1.4' fill='white'/%3E%3Cpath d='M12 12 L12 5 A7 7 0 0 1 18.2 9.4 Z' fill='rgba(255,255,255,.4)'/%3E%3C/svg%3E">
   <style>
     :root {
       color-scheme: light;
@@ -1246,7 +1329,26 @@ INDEX_HTML = r"""
     @keyframes drift2 { 0%,100% { transform: translate(0,0) scale(1);} 50% { transform: translate(30px,-30px) scale(1.1);} }
     button, input, textarea { font: inherit; }
 
+    /* hairline light along the very top; flows while the pipeline is busy */
+    .toplight {
+      position: fixed; top: 0; left: 0; right: 0; height: 2px; z-index: 60; pointer-events: none;
+      background: linear-gradient(90deg, transparent 4%, rgba(59,130,246,.5) 34%, rgba(29,78,216,.65) 50%, rgba(59,130,246,.5) 66%, transparent 96%);
+      background-size: 200% 100%;
+      opacity: .5;
+    }
+    body.is-busy .toplight { opacity: 1; animation: topflow 2.6s linear infinite; }
+    @keyframes topflow { from { background-position: 200% 0; } to { background-position: -200% 0; } }
+
     .app { position: relative; z-index: 1; display: grid; grid-template-columns: 372px minmax(0, 1fr); height: 100vh; overflow: hidden; }
+    /* faint blueprint grid behind the content, fading toward the edges */
+    .app::before {
+      content: ""; position: fixed; inset: 0; z-index: -1; pointer-events: none;
+      background:
+        repeating-linear-gradient(0deg, rgba(37,99,235,.05) 0 1px, transparent 1px 56px),
+        repeating-linear-gradient(90deg, rgba(37,99,235,.05) 0 1px, transparent 1px 56px);
+      -webkit-mask-image: radial-gradient(1300px 850px at 62% 28%, rgba(0,0,0,.85), transparent 78%);
+      mask-image: radial-gradient(1300px 850px at 62% 28%, rgba(0,0,0,.85), transparent 78%);
+    }
     .sidebar {
       border-right: 1px solid var(--line);
       background: linear-gradient(180deg, rgba(255,255,255,.92), rgba(246,249,255,.86));
@@ -1356,7 +1458,9 @@ INDEX_HTML = r"""
       border: 1px solid var(--line);
       background:
         radial-gradient(520px 200px at 100% 0%, rgba(59,130,246,.1), transparent 70%),
-        linear-gradient(180deg, #ffffff, var(--surface-2));
+        linear-gradient(180deg, rgba(255,255,255,.84), rgba(246,249,255,.74));
+      backdrop-filter: blur(14px);
+      -webkit-backdrop-filter: blur(14px);
       padding: 20px 22px; border-radius: 18px; box-shadow: var(--shadow);
       animation: cardRise .55s cubic-bezier(.2,.7,.3,1) both;
     }
@@ -1373,11 +1477,14 @@ INDEX_HTML = r"""
     .actions {
       display: grid; grid-template-columns: 1fr 150px; gap: 12px; align-content: center;
       border: 1px solid var(--line); border-radius: 18px; padding: 16px;
-      background: linear-gradient(180deg, #ffffff, var(--surface-2)); box-shadow: var(--shadow);
+      background: linear-gradient(180deg, rgba(255,255,255,.84), rgba(246,249,255,.74));
+      backdrop-filter: blur(14px);
+      -webkit-backdrop-filter: blur(14px);
+      box-shadow: var(--shadow);
       animation: cardRise .55s cubic-bezier(.2,.7,.3,1) .06s both;
     }
 
-    .metrics { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 13px; margin-bottom: 20px; }
+    .metrics { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 13px; margin-bottom: 20px; counter-reset: metric; }
     .metric {
       position: relative; overflow: hidden;
       border: 1px solid var(--line); border-radius: 16px;
@@ -1385,14 +1492,27 @@ INDEX_HTML = r"""
       min-height: 96px; padding: 15px 16px; box-shadow: var(--shadow-sm);
       transition: transform .18s ease, box-shadow .2s ease, border-color .2s ease;
       animation: cardRise .5s cubic-bezier(.2,.7,.3,1) both;
+      counter-increment: metric;
     }
     .metric:nth-child(1){animation-delay:.05s} .metric:nth-child(2){animation-delay:.1s}
     .metric:nth-child(3){animation-delay:.15s} .metric:nth-child(4){animation-delay:.2s}
     .metric:nth-child(5){animation-delay:.25s}
-    .metric:hover { transform: translateY(-3px); box-shadow: var(--shadow); border-color: var(--line-2); }
+    .metric:hover {
+      transform: translateY(-3px); box-shadow: var(--shadow); border-color: transparent;
+      background:
+        linear-gradient(180deg, #ffffff, var(--surface-2)) padding-box,
+        linear-gradient(150deg, var(--accent-3), var(--line-2) 45%, var(--accent-2)) border-box;
+    }
     .metric::before { content: ""; position: absolute; inset: 0 auto 0 0; width: 4px; background: linear-gradient(var(--accent-3), var(--accent-2)); }
     .metric::after { content: ""; position: absolute; right: -30px; top: -30px; width: 90px; height: 90px; border-radius: 50%; background: radial-gradient(circle, rgba(59,130,246,.12), transparent 70%); }
     .metric span { display: block; color: var(--muted); font-size: 11.5px; font-weight: 600; margin-bottom: 12px; letter-spacing: .3px; }
+    /* HUD-style card index in the top-right corner */
+    .metric span::after {
+      content: counter(metric, decimal-leading-zero);
+      position: absolute; top: 13px; right: 15px;
+      font-family: var(--mono); font-size: 10px; font-weight: 500; letter-spacing: 1px;
+      color: var(--dim); opacity: .75;
+    }
     .metric strong { font-family: var(--display); font-size: 27px; line-height: 1; font-weight: 800; color: var(--text); font-variant-numeric: tabular-nums; }
     .metric.flash strong { animation: metricFlash .9s ease; }
     @keyframes metricFlash { 0% { color: var(--accent); transform: scale(1.12); } 100% { color: var(--text); transform: scale(1); } }
@@ -1406,9 +1526,12 @@ INDEX_HTML = r"""
     .wm-hero-main strong.flash { animation: metricFlash .9s ease; }
     .wm-sub { color: var(--dim); font-size: 12px; font-family: var(--mono); }
     .wm-gauge { position: relative; width: 128px; height: 128px; border-radius: 50%; flex: none; z-index: 1;
-      background: conic-gradient(var(--accent-3) var(--deg,0deg), var(--surface-3) 0deg);
+      background: conic-gradient(var(--accent-3), var(--accent-2) var(--deg,0deg), var(--surface-3) 0deg);
+      box-shadow: 0 14px 30px -14px var(--accent-glow);
       transition: --deg .8s cubic-bezier(.3,.8,.3,1); display: grid; place-items: center; }
     .wm-gauge::before { content: ""; position: absolute; inset: 12px; border-radius: 50%; background: linear-gradient(180deg,#fff,var(--surface-2)); box-shadow: inset 0 1px 4px rgba(23,54,110,.12); }
+    /* tick mark at the z=4 detection threshold (half of the 0..8 scale = 180deg = bottom) */
+    .wm-gauge::after { content: ""; position: absolute; left: 50%; bottom: 0; width: 2px; height: 11px; transform: translateX(-50%); border-radius: 2px; background: var(--warn); opacity: .85; }
     .wm-gauge span { position: relative; z-index: 1; font-family: var(--mono); font-size: 12px; color: var(--muted); }
     .wm-metrics { grid-template-columns: repeat(4, minmax(0,1fr)); }
     @property --deg { syntax: "<angle>"; inherits: false; initial-value: 0deg; }
@@ -1425,7 +1548,8 @@ INDEX_HTML = r"""
     .tab:hover { color: var(--accent-2); background: rgba(37,99,235,.05); }
     .tab::after { content: ""; position: absolute; left: 12px; right: 12px; bottom: -1px; height: 3px; border-radius: 3px 3px 0 0; background: linear-gradient(90deg, var(--accent-3), var(--accent-2)); transform: scaleX(0); transform-origin: center; transition: transform .25s cubic-bezier(.2,.7,.3,1); }
     .tab.active { color: var(--accent-2); background: linear-gradient(180deg, #fff, var(--surface-2)); border-color: var(--line); box-shadow: 0 -3px 10px -8px rgba(23,54,110,.3); }
-    .tab.active::after { transform: scaleX(1); }
+    .tab.active::after { transform: scaleX(1); box-shadow: 0 2px 12px var(--accent-glow); }
+    .btn:focus-visible, .tab:focus-visible { outline: 2px solid var(--accent-3); outline-offset: 2px; }
 
     .pane { display: none; }
     .pane.active { display: block; animation: paneIn .38s cubic-bezier(.2,.7,.3,1) both; }
@@ -1478,6 +1602,9 @@ INDEX_HTML = r"""
     tbody tr { transition: background .15s ease; }
     tbody tr:hover { background: var(--surface-2); }
     tr:last-child td { border-bottom: 0; }
+    /* highlight the stage currently executing */
+    tr.row-running td { background: rgba(37,99,235,.055); }
+    tr.row-running td:first-child { box-shadow: inset 3px 0 0 var(--accent-3); }
 
     /* status pills */
     .pill { display: inline-flex; align-items: center; gap: 7px; padding: 4px 11px; border-radius: 999px; font-family: var(--font); font-size: 12px; font-weight: 600; border: 1px solid transparent; }
@@ -1504,6 +1631,7 @@ INDEX_HTML = r"""
       position: relative;
       height: 440px; overflow: auto; white-space: pre-wrap;
       background:
+        repeating-linear-gradient(0deg, rgba(148,197,255,.03) 0 1px, transparent 1px 3px),
         linear-gradient(180deg, rgba(37,99,235,.05), transparent 90px),
         #0d1b30;
       border: 1px solid #16345f; border-radius: 14px;
@@ -1511,6 +1639,25 @@ INDEX_HTML = r"""
       color: #cfe0f7; box-shadow: inset 0 2px 14px rgba(0,0,0,.35);
     }
     .logbox::-webkit-scrollbar-thumb { background: #2c4f80; }
+    /* semantic log-line tinting (classes assigned in renderPipeline) */
+    .log-line { display: block; }
+    .log-line:empty::before { content: "\00a0"; }
+    .log-line.log-err { color: #ff9285; }
+    .log-line.log-warn { color: #ffd479; }
+    .log-line.log-ok { color: #7ee2a8; }
+    .log-line.log-prog { color: #8ec1ff; }
+    /* wrapper so the jump-to-bottom chip can float over the scroller */
+    .log-wrap { position: relative; }
+    .log-jump {
+      position: absolute; right: 14px; bottom: 14px; z-index: 3;
+      border: 1px solid rgba(120,170,240,.35); border-radius: 999px;
+      background: rgba(16,32,58,.92); color: #9fc0ee;
+      font-family: var(--mono); font-size: 11px; padding: 6px 12px; cursor: pointer;
+      opacity: 0; pointer-events: none; transform: translateY(6px);
+      transition: opacity .2s ease, transform .2s ease, border-color .2s ease, color .2s ease;
+    }
+    .log-jump.show { opacity: 1; pointer-events: auto; transform: translateY(0); }
+    .log-jump:hover { color: #fff; border-color: var(--accent-3); }
     /* panel header row (outside the dark box) */
     .log-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
     /* terminal title bar pinned to the top of the dark box */
@@ -1523,7 +1670,13 @@ INDEX_HTML = r"""
       border-radius: 13px 13px 0 0;
     }
     .log-titlebar .log-path { font-family: var(--mono); font-size: 11.5px; color: #9fb6d8; letter-spacing: .3px; }
-    .log-titlebar .log-tag { margin-left: auto; }
+    .log-titlebar .log-tag { margin-left: auto; display: inline-flex; align-items: center; gap: 7px; }
+    /* macOS-style traffic lights */
+    .log-dots { display: inline-flex; gap: 6px; margin-right: 3px; flex: none; }
+    .log-dots i { width: 10px; height: 10px; border-radius: 50%; box-shadow: inset 0 -1px 1px rgba(0,0,0,.25); }
+    .log-dots i:nth-child(1) { background: #ff5f57; }
+    .log-dots i:nth-child(2) { background: #febc2e; }
+    .log-dots i:nth-child(3) { background: #28c840; }
     .log-live {
       width: 8px; height: 8px; border-radius: 50%; flex: none;
       background: #28c840; box-shadow: 0 0 0 0 rgba(40,200,64,.5);
@@ -1549,6 +1702,7 @@ INDEX_HTML = r"""
   </style>
 </head>
 <body>
+  <div class="toplight" aria-hidden="true"></div>
   <div class="app">
     <aside class="sidebar">
       <div class="brand">
@@ -1631,9 +1785,12 @@ INDEX_HTML = r"""
             <p class="panel-title" style="margin:0;">系统后台日志</p>
             <span class="log-tag">stdout · live</span>
           </div>
-          <div class="logbox">
-            <div class="log-titlebar"><span class="log-live"></span><span class="log-path">remote://pipeline.log</span><span class="log-tag">stdout · live</span></div>
-            <div class="log-body"><div id="logBox">No real tasks yet.</div></div>
+          <div class="log-wrap">
+            <div class="logbox">
+              <div class="log-titlebar"><span class="log-dots" aria-hidden="true"><i></i><i></i><i></i></span><span class="log-path">remote://pipeline.log</span><span class="log-tag"><span class="log-live"></span>stdout · live</span></div>
+              <div class="log-body"><div id="logBox">No real tasks yet.</div></div>
+            </div>
+            <button class="log-jump" id="logJumpBtn" type="button">↓ 回到底部</button>
           </div>
         </div>
       </section>
@@ -1693,7 +1850,39 @@ INDEX_HTML = r"""
     const $$ = (sel) => Array.from(document.querySelectorAll(sel));
     let state = { console_vars: {}, form_vars: {} };
     let pollTimer = null;
+    let wasRunning = false;
     const metricCache = {};
+    const REDUCED_MOTION = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+    // cosmetic per-line tint for the log terminal
+    function logLineClass(line) {
+      if (/error|failed|exception|traceback|fatal|错误|失败/i.test(line)) return " log-err";
+      if (/warn|警告/i.test(line)) return " log-warn";
+      if (/success|completed|finished|\bdone\b|完成|成功/i.test(line)) return " log-ok";
+      if (/\d{1,3}%\s*\||\|\s*\d+\s*\/\s*\d+|\bepoch\s*\d|\bperiod\s*\d/i.test(line)) return " log-prog";
+      return "";
+    }
+    // tween a numeric metric from its previous value; falls back to a plain set
+    // for non-numeric values (e.g. "-") or when the user prefers reduced motion
+    function tweenMetric(el, fromText, toText) {
+      if (el.__tween) cancelAnimationFrame(el.__tween);
+      const m = String(toText).match(/^(-?\d+(?:\.\d+)?)(.*)$/);
+      const from = parseFloat(fromText);
+      const to = m ? parseFloat(m[1]) : NaN;
+      if (REDUCED_MOTION || !m || isNaN(from) || isNaN(to) || from === to) { el.textContent = toText; return; }
+      const suffix = m[2] || "";
+      const decimals = (m[1].split(".")[1] || "").length;
+      const start = performance.now(), dur = 600;
+      const step = (now) => {
+        const t = Math.min(1, (now - start) / dur);
+        if (t >= 1) { el.textContent = toText; el.__tween = null; return; }
+        const eased = 1 - Math.pow(1 - t, 3);
+        el.textContent = (from + (to - from) * eased).toFixed(decimals) + suffix;
+        el.__tween = requestAnimationFrame(step);
+      };
+      el.__tween = requestAnimationFrame(step);
+    }
+    let lastLogSig = null;
     const consoleGroups = {
       globalFields: ["root_dir","reason_judge_dir","vla_mark_dir","python_bin","model_path","dataset_name","dataset_path","cuda_devices"],
       teacherFields: ["teacher_api_key","teacher_api_base","victim_model"],
@@ -1906,17 +2095,26 @@ INDEX_HTML = r"""
       const pctEl = $("#pipelinePercent");
       if (pctEl) pctEl.textContent = `${pct}%`;
       const running = rows.some(r => r.status === "running");
+      document.body.classList.toggle("is-busy", running);
       const wrap = $("#pipelineProgress").parentElement;
       if (wrap) wrap.classList.toggle("is-running", running);
       const tbody = $("#taskTable tbody");
-      tbody.innerHTML = rows.map((row, i) => `<tr><td>${row.stage}</td><td><span class="pill status-${row.status}"><i></i>${row.status}</span></td><td>${cells[i]}</td><td>${row.script}</td></tr>`).join("");
+      tbody.innerHTML = rows.map((row, i) => `<tr${row.status === "running" ? ' class="row-running"' : ""}><td>${row.stage}</td><td><span class="pill status-${row.status}"><i></i>${row.status}</span></td><td>${cells[i]}</td><td>${row.script}</td></tr>`).join("");
       const logBox = $("#logBox");
       const scroller = logBox.closest(".logbox") || logBox;
-      const first = scroller.scrollTop;
-      const atBottom = scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 12;
-      logBox.textContent = (logs.length ? logs : ["No logs yet."]).join("\n");
-      if (atBottom) scroller.scrollTop = scroller.scrollHeight;
-      else scroller.scrollTop = first;
+      const lines = logs.length ? logs : ["No logs yet."];
+      const sig = lines.join("\n");
+      if (sig !== lastLogSig) {
+        lastLogSig = sig;
+        const first = scroller.scrollTop;
+        const atBottom = scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 12;
+        logBox.innerHTML = lines.map(l => `<span class="log-line${logLineClass(l)}">${escapeHtml(l)}</span>`).join("");
+        if (atBottom) scroller.scrollTop = scroller.scrollHeight;
+        else scroller.scrollTop = first;
+      }
+      // a run just finished -> pull fresh numbers so the cards stop showing "-"
+      if (wasRunning && !running) { refreshDashboard(); refreshWatermark(); }
+      wasRunning = running;
     }
     async function refreshStatus() {
       const res = await fetch("/api/tasks/status");
@@ -1925,12 +2123,13 @@ INDEX_HTML = r"""
     function setMetric(id, value) {
       const el = $(id);
       const v = value || "-";
-      if (metricCache[id] !== undefined && metricCache[id] !== v && v !== "-") {
+      const prev = metricCache[id];
+      if (prev !== undefined && prev !== v && v !== "-") {
         const card = el.closest(".metric");
         if (card) { card.classList.remove("flash"); void card.offsetWidth; card.classList.add("flash"); }
       }
       metricCache[id] = v;
-      el.textContent = v;
+      tweenMetric(el, prev, v);
     }
     async function refreshDashboard() {
       const res = await fetch("/api/dashboard");
@@ -1952,11 +2151,12 @@ INDEX_HTML = r"""
       const m = data.metrics || {};
       const meanEl = $("#wmMeanZ");
       if (meanEl) {
-        if (wmMeanCache !== null && wmMeanCache !== m.mean_z && (m.mean_z || "-") !== "-") {
+        const prevMean = wmMeanCache;
+        if (prevMean !== null && prevMean !== m.mean_z && (m.mean_z || "-") !== "-") {
           meanEl.classList.remove("flash"); void meanEl.offsetWidth; meanEl.classList.add("flash");
         }
         wmMeanCache = m.mean_z;
-        meanEl.textContent = m.mean_z || "-";
+        tweenMetric(meanEl, prevMean, m.mean_z || "-");
       }
       $("#wmMedianZ").textContent = m.median_z || "-";
       $("#wmMinZ").textContent = m.min_z || "-";
@@ -1969,7 +2169,7 @@ INDEX_HTML = r"""
         if (!isNaN(meanZ)) {
           const frac = Math.max(0, Math.min(1, meanZ / 8));
           gauge.style.setProperty("--deg", `${(frac * 360).toFixed(1)}deg`);
-          gauge.style.background = `conic-gradient(${meanZ > 4 ? "var(--ok)" : "var(--accent-3)"} var(--deg,0deg), var(--surface-3) 0deg)`;
+          gauge.style.background = `conic-gradient(${meanZ > 4 ? "#34d399, var(--ok)" : "var(--accent-3), var(--accent-2)"} var(--deg,0deg), var(--surface-3) 0deg)`;
           gauge.querySelector("span").textContent = meanZ > 4 ? "有水印" : "偏弱";
         } else {
           gauge.style.setProperty("--deg", "0deg");
@@ -1978,6 +2178,8 @@ INDEX_HTML = r"""
       }
       const scope = $("#wmScope");
       if (scope) scope.textContent = data.ok ? `已评分 ${data.num_scored ?? "?"} / ${data.num_total ?? "?"} 条 · split=${data.split ?? "?"}` : "尚未运行检测";
+      // results are in -> stop the 3s catch-up poll started by the detect button
+      if (data.ok && window.__wmPoll) { clearInterval(window.__wmPoll); window.__wmPoll = null; }
     }
     function startPolling() {
       if (pollTimer) clearInterval(pollTimer);
@@ -2025,6 +2227,15 @@ INDEX_HTML = r"""
       $$("#refreshStatusBtn, #refreshDashboardBtn, #refreshRiskBtn").forEach(btn => btn.addEventListener("click", () => { refreshStatus(); refreshDashboard(); }));
       const wmBtn = $("#refreshWatermarkBtn");
       if (wmBtn) wmBtn.addEventListener("click", refreshWatermark);
+      const logScroller = $(".logbox");
+      const logJump = $("#logJumpBtn");
+      if (logScroller && logJump) {
+        logScroller.addEventListener("scroll", () => {
+          const atBottom = logScroller.scrollTop + logScroller.clientHeight >= logScroller.scrollHeight - 24;
+          logJump.classList.toggle("show", !atBottom);
+        });
+        logJump.addEventListener("click", () => { logScroller.scrollTop = logScroller.scrollHeight; });
+      }
       $$("[data-task]").forEach(btn => btn.addEventListener("click", async () => {
         const data = await post(`/api/tasks/${btn.dataset.task}`);
         if (data.pipeline) renderPipeline(data.pipeline);
