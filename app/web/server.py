@@ -2329,15 +2329,18 @@ INDEX_HTML = r"""
     .debug-only { display: none; }
     body.debug .debug-only { display: block; }
 
-    .assistant-orb { position: fixed; z-index: 1200; right: 22px; bottom: 24px; width: 58px; height: 58px; border: 0; border-radius: 50%; display: grid; place-items: center; background: linear-gradient(145deg, var(--accent-3), var(--accent-2)); color: #fff; font-family: var(--display); font-size: 16px; font-weight: 800; letter-spacing: .5px; box-shadow: 0 10px 24px rgba(37,99,235,.28), 0 0 0 5px rgba(37,99,235,.09); cursor: grab; user-select: none; touch-action: none; transition: left .28s ease, top .28s ease, right .28s ease, bottom .28s ease, transform .18s ease, box-shadow .18s ease; }
+    .assistant-orb { --assistant-orb-core-inset: 5px; position: fixed; z-index: 1200; right: 22px; top: 38%; width: 58px; height: 58px; border: 0; border-radius: 50%; display: grid; place-items: center; background: linear-gradient(145deg, var(--accent-3), var(--accent-2)); color: #fff; font-family: var(--display); font-size: 16px; font-weight: 800; letter-spacing: .5px; box-shadow: 0 10px 24px rgba(37,99,235,.28), 0 0 0 5px rgba(37,99,235,.09); cursor: grab; user-select: none; touch-action: none; transition: left .28s ease, top .28s ease, right .28s ease, bottom .28s ease, transform .18s ease, box-shadow .18s ease; }
     .assistant-orb:hover { transform: translateY(-2px) scale(1.04); box-shadow: 0 14px 30px rgba(37,99,235,.34), 0 0 0 6px rgba(37,99,235,.11); }
     .assistant-orb.dragging { cursor: grabbing; transition: none; transform: scale(1.04); }
     .assistant-orb.assistant-hidden { opacity: 0; pointer-events: none; transform: scale(.72); }
-    .assistant-orb span, .assistant-orb svg { pointer-events: none; }
-    .assistant-orb svg { width: 29px; height: 29px; display: block; transform: translate(0, 2px); }
+    .assistant-orb svg { width: 29px; height: 29px; display: block; transform: translate(0, 2px); pointer-events: none; }
     .assistant-panel { position: fixed; z-index: 1190; right: 22px; bottom: 94px; width: min(410px, calc(100vw - 32px)); height: min(610px, calc(100vh - 120px)); display: flex; flex-direction: column; overflow: hidden; border: 1px solid var(--line); border-radius: 16px; background: rgba(255,255,255,.97); box-shadow: 0 18px 50px rgba(23,54,110,.22); opacity: 0; pointer-events: none; transform: translateY(12px) scale(.98); transition: opacity .18s ease, transform .18s ease; }
     .assistant-panel.open { opacity: 1; pointer-events: auto; transform: translateY(0) scale(1); }
-    .assistant-head { display: flex; align-items: center; gap: 10px; padding: 14px 15px; border-bottom: 1px solid var(--line); background: linear-gradient(135deg, #f8fbff, #eef5ff); }
+    .assistant-panel.closing { opacity: 1; pointer-events: none; transform: none; transition: none; }
+    .assistant-panel.opening { pointer-events: none; transition: none; }
+    .assistant-orb.assistant-morph-target { opacity: 0; pointer-events: none; transform: scale(.827586); }
+    .assistant-head { display: flex; align-items: center; gap: 10px; padding: 14px 15px; border-bottom: 1px solid var(--line); background: linear-gradient(135deg, #f8fbff, #eef5ff); cursor: grab; user-select: none; touch-action: none; }
+    .assistant-panel.dragging .assistant-head { cursor: grabbing; }
     .assistant-head strong { flex: 1; font-family: var(--display); font-size: 14px; }
     .assistant-head small { color: var(--muted); font-size: 11px; }
     .assistant-icon { width: 30px; height: 30px; display: grid; place-items: center; border-radius: 10px; background: var(--accent-soft); color: var(--accent-2); font-weight: 800; }
@@ -2400,7 +2403,7 @@ INDEX_HTML = r"""
       .app.sidebar-collapsed .sidebar-toggle .toggle-chevron { transform:rotate(270deg); }
       .metric strong { font-size:24px; }
     }
-    @media (max-width: 560px) { .assistant-panel { right: 12px; bottom: 84px; width: calc(100vw - 24px); height: min(600px, calc(100vh - 105px)); } .assistant-orb { right: 14px; bottom: 14px; } }
+    @media (max-width: 560px) { .assistant-panel { right: 12px; bottom: 84px; width: calc(100vw - 24px); height: min(600px, calc(100vh - 105px)); } .assistant-orb { right: 14px; top: 40%; } }
   </style>
 </head>
 <body>
@@ -2808,46 +2811,290 @@ INDEX_HTML = r"""
     function wireAssistant() {
       const orb = $("#assistantOrb");
       const panel = $("#assistantPanel");
-      let drag = null;
+      const assistantHead = panel.querySelector(".assistant-head");
+      const orbIcon = orb.querySelector("svg");
+      let orbDrag = null;
+      let panelDrag = null;
+      let closeTimer = null;
+      let orbRevealTimer = null;
+      let panelMorphAnimation = null;
+      let panelContentAnimations = [];
+      let orbMorphAnimation = null;
+      let orbIconAnimation = null;
+      const ASSISTANT_MORPH_MS = REDUCED_MOTION ? 0 : 420;
+      // Let the orb and its mark take over while the panel is still visibly
+      // shrinking, so the mark does not pop in at the very end.
+      const ORB_REVEAL_MS = REDUCED_MOTION ? 0 : 210;
+      const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
+      const cancelPanelAnimations = () => {
+        panelMorphAnimation?.cancel();
+        panelMorphAnimation = null;
+        panelContentAnimations.forEach(animation => animation.cancel());
+        panelContentAnimations = [];
+      };
+      const cancelOrbAnimations = () => {
+        orbMorphAnimation?.cancel();
+        orbMorphAnimation = null;
+        orbIconAnimation?.cancel();
+        orbIconAnimation = null;
+      };
+      const cancelAnimations = () => {
+        cancelPanelAnimations();
+        cancelOrbAnimations();
+      };
+      const getOrbTarget = () => {
+        const style = getComputedStyle(orb);
+        const boxWidth = orb.clientWidth;
+        const boxHeight = orb.clientHeight;
+        const coreInset = Math.max(0, parseFloat(style.getPropertyValue("--assistant-orb-core-inset")) || 0);
+        const width = Math.max(1, boxWidth - coreInset * 2);
+        const height = Math.max(1, boxHeight - coreInset * 2);
+        const boxLeft = orb.style.left && orb.style.left !== "auto"
+          ? parseFloat(orb.style.left)
+          : window.innerWidth - boxWidth - parseFloat(style.right || "22");
+        const boxTop = orb.style.top && orb.style.top !== "auto"
+          ? parseFloat(orb.style.top)
+          : style.top !== "auto"
+            ? parseFloat(style.top)
+            : window.innerHeight - boxHeight - parseFloat(style.bottom || "24");
+        const boundedBoxLeft = clamp(boxLeft, 8, window.innerWidth - boxWidth - 8);
+        const boundedBoxTop = clamp(boxTop, 8, window.innerHeight - boxHeight - 8);
+        return {
+          left: boundedBoxLeft + coreInset,
+          top: boundedBoxTop + coreInset,
+          orbLeft: boundedBoxLeft,
+          orbTop: boundedBoxTop,
+          width,
+          height,
+        };
+      };
+      const snapOrbToEdge = () => {
+        const rect = orb.getBoundingClientRect();
+        const top = clamp(rect.top, 8, window.innerHeight - orb.offsetHeight - 8);
+        const onLeft = rect.left + rect.width / 2 < window.innerWidth / 2;
+        orb.style.left = (onLeft ? 18 : Math.max(8, window.innerWidth - orb.offsetWidth - 18)) + "px";
+        orb.style.top = top + "px";
+        orb.style.right = "auto";
+        orb.style.bottom = "auto";
+      };
       const setAssistantOpen = open => {
-        panel.classList.toggle("open", open);
-        orb.classList.toggle("assistant-hidden", open);
-        orb.setAttribute("aria-hidden", String(open));
+        if (closeTimer) {
+          clearTimeout(closeTimer);
+          closeTimer = null;
+        }
+        if (orbRevealTimer) {
+          clearTimeout(orbRevealTimer);
+          orbRevealTimer = null;
+        }
+        cancelAnimations();
+        if (open) {
+          if (panel.classList.contains("open")) return;
+          panel.classList.remove("closing");
+          panel.classList.add("open", "opening");
+          void panel.offsetWidth;
+          const panelRect = panel.getBoundingClientRect();
+          const target = getOrbTarget();
+          const panelStyle = getComputedStyle(panel);
+          const dx = target.left - panelRect.left;
+          const dy = target.top - panelRect.top;
+          const scaleX = target.width / panelRect.width;
+          const scaleY = target.height / panelRect.height;
+          panelMorphAnimation = panel.animate(
+            [
+              {
+                transform: `translate(${dx}px, ${dy}px) scale(${scaleX}, ${scaleY})`,
+                transformOrigin: "top left",
+                borderRadius: "50%",
+                borderColor: "transparent",
+                backgroundColor: "rgb(37, 99, 235)",
+                boxShadow: "none",
+              },
+              {
+                transform: "none",
+                transformOrigin: "top left",
+                borderRadius: panelStyle.borderRadius,
+                borderColor: panelStyle.borderColor,
+                backgroundColor: panelStyle.backgroundColor,
+                boxShadow: panelStyle.boxShadow,
+              },
+            ],
+            { duration: ASSISTANT_MORPH_MS, easing: "cubic-bezier(.22,.8,.28,1)", fill: "forwards" },
+          );
+          panelContentAnimations = Array.from(panel.children).map(child => child.animate(
+            [{ opacity: 0 }, { opacity: 1 }],
+            { duration: Math.min(140, ASSISTANT_MORPH_MS), delay: Math.max(0, ASSISTANT_MORPH_MS - 150), easing: "ease", fill: "both" },
+          ));
+          orb.style.left = target.orbLeft + "px";
+          orb.style.top = target.orbTop + "px";
+          orb.style.right = "auto";
+          orb.style.bottom = "auto";
+          orb.classList.remove("assistant-hidden");
+          orb.classList.add("assistant-morph-target");
+          orb.setAttribute("aria-hidden", "true");
+          closeTimer = window.setTimeout(() => {
+            cancelPanelAnimations();
+            panel.classList.remove("opening");
+            orb.classList.remove("assistant-morph-target");
+            orb.classList.add("assistant-hidden");
+            orb.setAttribute("aria-hidden", "true");
+            closeTimer = null;
+          }, ASSISTANT_MORPH_MS);
+          return;
+        }
+        if (!panel.classList.contains("open")) return;
+        const panelRect = panel.getBoundingClientRect();
+        const target = getOrbTarget();
+        const panelStyle = getComputedStyle(panel);
+        const dx = target.left - panelRect.left;
+        const dy = target.top - panelRect.top;
+        const scaleX = target.width / panelRect.width;
+        const scaleY = target.height / panelRect.height;
+        panel.classList.remove("opening");
+        panel.classList.add("closing");
+        panelMorphAnimation = panel.animate(
+          [
+            {
+              transform: "none",
+              transformOrigin: "top left",
+              borderRadius: panelStyle.borderRadius,
+              borderColor: panelStyle.borderColor,
+              backgroundColor: panelStyle.backgroundColor,
+              boxShadow: panelStyle.boxShadow,
+            },
+            {
+              transform: `translate(${dx}px, ${dy}px) scale(${scaleX}, ${scaleY})`,
+              transformOrigin: "top left",
+              borderRadius: "50%",
+              borderColor: "transparent",
+              backgroundColor: "rgb(37, 99, 235)",
+              boxShadow: "none",
+            },
+          ],
+          { duration: ASSISTANT_MORPH_MS, easing: "cubic-bezier(.22,.8,.28,1)", fill: "forwards" },
+        );
+        panelContentAnimations = Array.from(panel.children).map(child => child.animate(
+          [{ opacity: 1 }, { opacity: 0 }],
+          { duration: Math.min(140, ASSISTANT_MORPH_MS), easing: "ease", fill: "forwards" },
+        ));
+        orb.style.left = target.orbLeft + "px";
+        orb.style.top = target.orbTop + "px";
+        orb.style.right = "auto";
+        orb.style.bottom = "auto";
+        orb.classList.remove("assistant-hidden");
+        orb.classList.add("assistant-morph-target");
+        orb.setAttribute("aria-hidden", "true");
+        const orbShadow = getComputedStyle(orb).boxShadow;
+        // The morphing panel is itself a blue circle near the end of the
+        // animation. When the panel starts far away, keep the real orb hidden
+        // until that travelling circle is almost at the destination; otherwise
+        // the two circles can be visible at once.
+        const panelCenterX = panelRect.left + panelRect.width / 2;
+        const panelCenterY = panelRect.top + panelRect.height / 2;
+        const targetCenterX = target.left + target.width / 2;
+        const targetCenterY = target.top + target.height / 2;
+        const morphDistance = Math.hypot(targetCenterX - panelCenterX, targetCenterY - panelCenterY);
+        const orbRevealDuration = REDUCED_MOTION
+          ? 0
+          : Math.round(clamp(ORB_REVEAL_MS * 320 / Math.max(320, morphDistance), 108, ORB_REVEAL_MS));
+        const revealAt = Math.max(0, ASSISTANT_MORPH_MS - orbRevealDuration);
+        orbIconAnimation = orbIcon?.animate(
+          [
+            { opacity: 0, transform: "translate(0, 2px) scale(.48)" },
+            { opacity: .58, transform: "translate(0, 2px) scale(.82)" },
+            { opacity: 1, transform: "translate(0, 2px) scale(1)" },
+          ],
+          { duration: orbRevealDuration, delay: revealAt, easing: "cubic-bezier(.22,.8,.28,1)", fill: "both" },
+        ) || null;
+        orbRevealTimer = window.setTimeout(() => {
+          orbMorphAnimation = orb.animate(
+            [
+              { opacity: 0, transform: "scale(.827586)", boxShadow: "none" },
+              { opacity: 1, transform: "scale(1)", boxShadow: orbShadow },
+            ],
+            { duration: orbRevealDuration, easing: "cubic-bezier(.22,.8,.28,1)", fill: "forwards" },
+          );
+          orbRevealTimer = null;
+        }, revealAt);
+        closeTimer = window.setTimeout(() => {
+          // Freeze and hide before cancelling the filled animation; otherwise the base CSS transition can flash the panel back.
+          panel.style.transition = "none";
+          panel.style.visibility = "hidden";
+          panel.classList.remove("open", "closing");
+          void panel.offsetWidth;
+          cancelPanelAnimations();
+          panel.style.transition = "";
+          panel.style.visibility = "";
+          orb.classList.remove("assistant-morph-target");
+          cancelOrbAnimations();
+          orb.setAttribute("aria-hidden", "false");
+          requestAnimationFrame(snapOrbToEdge);
+          closeTimer = null;
+        }, ASSISTANT_MORPH_MS);
       };
       orb.addEventListener("pointerdown", event => {
         const rect = orb.getBoundingClientRect();
-        drag = { id: event.pointerId, startX: event.clientX, startY: event.clientY, moved: false, offsetX: event.clientX - rect.left, offsetY: event.clientY - rect.top };
+        orbDrag = { id: event.pointerId, startX: event.clientX, startY: event.clientY, moved: false, offsetX: event.clientX - rect.left, offsetY: event.clientY - rect.top };
         orb.setPointerCapture(event.pointerId);
         orb.classList.add("dragging");
       });
       orb.addEventListener("pointermove", event => {
-        if (!drag || drag.id !== event.pointerId) return;
-        const dx = event.clientX - drag.startX;
-        const dy = event.clientY - drag.startY;
-        if (Math.hypot(dx, dy) > 5) drag.moved = true;
-        if (!drag.moved) return;
-        const left = Math.max(8, Math.min(window.innerWidth - orb.offsetWidth - 8, event.clientX - drag.offsetX));
-        const top = Math.max(8, Math.min(window.innerHeight - orb.offsetHeight - 8, event.clientY - drag.offsetY));
+        if (!orbDrag || orbDrag.id !== event.pointerId) return;
+        const dx = event.clientX - orbDrag.startX;
+        const dy = event.clientY - orbDrag.startY;
+        if (Math.hypot(dx, dy) > 5) orbDrag.moved = true;
+        if (!orbDrag.moved) return;
+        const left = clamp(event.clientX - orbDrag.offsetX, 8, window.innerWidth - orb.offsetWidth - 8);
+        const top = clamp(event.clientY - orbDrag.offsetY, 8, window.innerHeight - orb.offsetHeight - 8);
         orb.style.left = left + "px";
         orb.style.top = top + "px";
         orb.style.right = "auto";
         orb.style.bottom = "auto";
       });
       orb.addEventListener("pointerup", event => {
-        if (!drag || drag.id !== event.pointerId) return;
-        const moved = drag.moved;
+        if (!orbDrag || orbDrag.id !== event.pointerId) return;
+        const moved = orbDrag.moved;
         orb.releasePointerCapture(event.pointerId);
         orb.classList.remove("dragging");
-        if (moved) {
-          orb.style.left = Math.max(8, window.innerWidth - orb.offsetWidth - 18) + "px";
-          orb.style.top = Math.max(8, Math.min(window.innerHeight - orb.offsetHeight - 8, orb.getBoundingClientRect().top)) + "px";
-        } else {
+        if (moved) snapOrbToEdge();
+        else {
           const open = !panel.classList.contains("open");
           setAssistantOpen(open);
           if (open) $("#assistantInput").focus();
         }
-        drag = null;
+        orbDrag = null;
       });
+      orb.addEventListener("pointercancel", event => {
+        if (!orbDrag || orbDrag.id !== event.pointerId) return;
+        orb.releasePointerCapture(event.pointerId);
+        orb.classList.remove("dragging");
+        snapOrbToEdge();
+        orbDrag = null;
+      });
+      assistantHead.addEventListener("pointerdown", event => {
+        if (event.target.closest("button, input, textarea, select")) return;
+        const rect = panel.getBoundingClientRect();
+        panelDrag = { id: event.pointerId, offsetX: event.clientX - rect.left, offsetY: event.clientY - rect.top };
+        assistantHead.setPointerCapture(event.pointerId);
+        panel.classList.add("dragging");
+        event.preventDefault();
+      });
+      assistantHead.addEventListener("pointermove", event => {
+        if (!panelDrag || panelDrag.id !== event.pointerId) return;
+        const left = clamp(event.clientX - panelDrag.offsetX, 8, window.innerWidth - panel.offsetWidth - 8);
+        const top = clamp(event.clientY - panelDrag.offsetY, 8, window.innerHeight - panel.offsetHeight - 8);
+        panel.style.left = left + "px";
+        panel.style.top = top + "px";
+        panel.style.right = "auto";
+        panel.style.bottom = "auto";
+      });
+      const finishPanelDrag = event => {
+        if (!panelDrag || panelDrag.id !== event.pointerId) return;
+        assistantHead.releasePointerCapture(event.pointerId);
+        panel.classList.remove("dragging");
+        panelDrag = null;
+      };
+      assistantHead.addEventListener("pointerup", finishPanelDrag);
+      assistantHead.addEventListener("pointercancel", finishPanelDrag);
       $("#assistantCloseBtn").addEventListener("click", () => setAssistantOpen(false));
       $("#assistantSettingsBtn").addEventListener("click", () => $("#assistantSettings").classList.toggle("open"));
       $("#assistantForm").addEventListener("submit", event => { event.preventDefault(); sendAssistantMessage(); });
