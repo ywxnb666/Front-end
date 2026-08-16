@@ -288,6 +288,7 @@ class MainWindow:
             else:
                 self.console_vars[key] = tk.StringVar(value=value)
         self._apply_saved_console_vars()
+        self._migrate_legacy_stage2_paths()
         self.console_vars["result_dir"].trace_add("write", lambda *_: self._refresh_derived_console_paths())
         self.console_vars["stage2_adapter"].trace_add("write", lambda *_: self._refresh_derived_console_paths())
         self.console_vars["reason_judge_dir"].trace_add("write", lambda *_: self._refresh_reason_judge_paths())
@@ -399,6 +400,27 @@ class MainWindow:
         if configured:
             return configured
         return self._path_join(self._default_project_root(repo_root), "datasets")
+
+    def _looks_like_legacy_stage2_adapter(self, path: object) -> bool:
+        text = str(path or "").replace("\\", "/")
+        return text.endswith("/stage2_sub1_period7") or text.endswith("/stage2/stage2_sub1_period7")
+
+    def _migrate_legacy_stage2_paths(self) -> None:
+        root_dir = str(self.console_vars["root_dir"].get()).strip()
+        if not root_dir:
+            return
+        stage2_final = self._path_join(root_dir, "vq_lord_ckpts", "stage2", "stage2_lord_final")
+        if self._looks_like_legacy_stage2_adapter(self.console_vars["stage2_adapter"].get()):
+            self.console_vars["stage2_adapter"].set(stage2_final)
+        for key in ("STAGE2_FINAL_ADAPTER_PATH", "ADAPTER_PATH"):
+            variable = self.form_vars.get(key)
+            if variable is not None and self._looks_like_legacy_stage2_adapter(variable.get()):
+                variable.set(stage2_final)
+        codebook_var = self.form_vars.get("VQ_CODEBOOK_PATH")
+        if codebook_var is not None:
+            codebook = str(codebook_var.get()).replace("\\", "/")
+            if codebook.endswith("/stage2_sub1_period7/vq_codebook.pt") or codebook.endswith("/stage2/stage2_sub1_period7/vq_codebook.pt"):
+                codebook_var.set(self._path_join(stage2_final, "vq_codebook.pt"))
 
     def _console_path_defaults(self, repo_root: str) -> dict[str, str]:
         repo_root = posixpath.normpath(repo_root.strip().rstrip("/") or REPO_DIR_NAME)
@@ -1394,8 +1416,10 @@ class MainWindow:
         dataset_path = self._console_value("dataset_path")
         teacher_key = self._console_value("teacher_api_key")
         teacher_base = self._normalize_openai_base_url(self._console_value("teacher_api_base"))
-        judge_key = self._console_value("judge_api_key") or teacher_key
-        judge_base = self._normalize_openai_base_url(self._console_value("judge_api_base") or teacher_base)
+        judge_key = self._form_value("JUDGE_API_KEY") or self._console_value("judge_api_key") or teacher_key
+        judge_base = self._normalize_openai_base_url(
+            self._form_value("JUDGE_API_BASE") or self._console_value("judge_api_base") or teacher_base
+        )
         updates = {
             "PYTHONUNBUFFERED": "1",
             "ROOT_DIR": root_dir,
@@ -1411,6 +1435,8 @@ class MainWindow:
             "TEACHER_API_BASE": teacher_base,
             "OPENAI_API_KEY": judge_key,
             "OPENAI_BASE_URL": judge_base,
+            "JUDGE_API_KEY": judge_key,
+            "JUDGE_API_BASE": judge_base,
             "VICTIM_MODEL": self._console_value("victim_model"),
             "STAGE1_CKPT_PATH": self._console_value("stage1_ckpt"),
             "STAGE2_FINAL_ADAPTER_PATH": self._console_value("stage2_adapter"),
@@ -1439,6 +1465,11 @@ class MainWindow:
             "TEACHER_API_BASE",
             "OPENAI_API_KEY",
             "OPENAI_BASE_URL",
+            "STAGE1_CKPT_PATH",
+            "STAGE2_FINAL_ADAPTER_PATH",
+            "ADAPTER_PATH",
+            "VQ_CODEBOOK_PATH",
+            "RESULT_DIR",
         }
         obsolete_form_keys = {
             "RUN_TEACHER_SPECIAL_BENCHMARKS",
@@ -1689,6 +1720,9 @@ class MainWindow:
             for key, value in form_vars.items():
                 variable = self.form_vars.setdefault(str(key), tk.StringVar())
                 variable.set(str(value))
+        self._migrate_legacy_stage2_paths()
+        self._refresh_derived_console_paths()
+        self._refresh_reason_judge_paths()
         self._save_app_config()
         self._append_real_log("[config] loaded remote frontend config")
 
@@ -2054,11 +2088,18 @@ class MainWindow:
             "CHARTQA_DATASET",
             "CHARTQA_SPLIT",
         }
+        protected_form_keys = {
+            "STAGE1_CKPT_PATH",
+            "STAGE2_FINAL_ADAPTER_PATH",
+            "ADAPTER_PATH",
+            "VQ_CODEBOOK_PATH",
+            "RESULT_DIR",
+        }
         return {
             "connection_command": self.connection_command_var.get().strip(),
             "project_path": self.project_var.get().strip(),
             "console_vars": {key: self._variable_snapshot(variable) for key, variable in self.console_vars.items()},
-            "form_vars": {key: variable.get() for key, variable in self.form_vars.items() if key not in obsolete_form_keys},
+            "form_vars": {key: variable.get() for key, variable in self.form_vars.items() if key not in obsolete_form_keys and key not in protected_form_keys},
         }
 
     def _save_app_config(self) -> None:
