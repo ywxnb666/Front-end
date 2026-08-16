@@ -1896,7 +1896,16 @@ INDEX_HTML = r"""
     body.is-busy .toplight { opacity: 1; animation: topflow 2.6s linear infinite; }
     @keyframes topflow { from { background-position: 200% 0; } to { background-position: -200% 0; } }
 
-    .app { position: relative; z-index: 1; display: grid; grid-template-columns: 372px minmax(0, 1fr); height: 100vh; overflow: hidden; }
+    .app {
+      --sidebar-width: 372px;
+      --sidebar-duration: .46s;
+      --sidebar-ease: cubic-bezier(.22,.8,.28,1);
+      position: relative; z-index: 1; display: grid;
+      grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
+      height: 100vh; overflow: hidden;
+      transition: grid-template-columns var(--sidebar-duration) var(--sidebar-ease);
+    }
+    .app.sidebar-collapsed { --sidebar-width: 28px; }
     /* faint blueprint grid behind the content, fading toward the edges */
     .app::before {
       content: ""; position: fixed; inset: 0; z-index: -1; pointer-events: none;
@@ -1911,9 +1920,28 @@ INDEX_HTML = r"""
       border-right: 1px solid var(--line);
       background: linear-gradient(180deg, rgba(255,255,255,.92), rgba(246,249,255,.86));
       backdrop-filter: blur(8px);
-      overflow: auto;
+      overflow-x: hidden;
+      overflow-y: auto;
       padding: 20px 18px 30px;
       box-shadow: 1px 0 0 rgba(255,255,255,.6), var(--shadow-sm);
+      transition: padding var(--sidebar-duration) var(--sidebar-ease), box-shadow .3s ease;
+    }
+    .sidebar > .brand, .sidebar > .section, .sidebar > form {
+      width: 336px;
+      opacity: 1;
+      transform: translateX(0);
+      visibility: visible;
+      transition: opacity .3s ease .08s, transform var(--sidebar-duration) var(--sidebar-ease);
+    }
+    .app.sidebar-collapsed .sidebar { padding-left: 0; padding-right: 0; overflow-y: hidden; box-shadow: 1px 0 0 rgba(255,255,255,.7); }
+    .app.sidebar-collapsed .sidebar > .brand,
+    .app.sidebar-collapsed .sidebar > .section,
+    .app.sidebar-collapsed .sidebar > form {
+      opacity: 0;
+      transform: translateX(-72px);
+      visibility: hidden;
+      pointer-events: none;
+      transition: opacity .28s ease, transform var(--sidebar-duration) var(--sidebar-ease), visibility 0s var(--sidebar-duration);
     }
     .main { position: relative; min-width: 0; overflow: auto; padding: 24px 26px 30px; }
 
@@ -2050,6 +2078,31 @@ INDEX_HTML = r"""
     }
     @keyframes scan { 0% { left: -40%; } 100% { left: 100%; } }
     .hero h1 { font-size: 23px; }
+    .sidebar-toggle {
+      position: absolute; z-index: 30;
+      top: 50%; left: calc(var(--sidebar-width) + 3px);
+      width: 16px; height: 74px; padding: 0;
+      display: grid; place-items: center;
+      border: 1px solid rgba(148,177,218,.55); border-radius: 0 8px 8px 0;
+      background: rgba(255,255,255,.58);
+      -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px);
+      color: var(--accent-2); box-shadow: 2px 0 9px rgba(23,54,110,.1);
+      opacity: .6;
+      overflow: hidden;
+      cursor: pointer;
+      transform: translateY(-50%);
+      transition: left var(--sidebar-duration) var(--sidebar-ease), opacity .18s ease, color .18s ease, border-color .18s ease, background .18s ease, box-shadow .22s ease, transform .18s ease;
+    }
+    .sidebar-toggle:hover { color: var(--accent); border-color: rgba(59,130,246,.72); background: rgba(255,255,255,.86); box-shadow: 3px 0 12px rgba(23,54,110,.16); opacity: .95; }
+    .sidebar-toggle:active { transform: translateY(-50%) scale(.94); }
+    .sidebar-toggle:focus-visible { outline: 2px solid var(--accent-3); outline-offset: 3px; }
+    .sidebar-toggle svg { width: 14px; height: 30px; display: block; filter: drop-shadow(0 1px 1px rgba(29,78,216,.18)); }
+    .sidebar-toggle .toggle-chevron {
+      transform-box: fill-box;
+      transform-origin: center;
+      transition: transform var(--sidebar-duration) var(--sidebar-ease);
+    }
+    .app.sidebar-collapsed .sidebar-toggle .toggle-chevron { transform: rotate(180deg); }
     .hero p { margin: 10px 0 0; color: var(--muted); font-size: 13px; font-weight: 500; display: flex; align-items: center; gap: 9px; }
     .hero p::before { content: ""; flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 4px var(--accent-soft); }
     .actions {
@@ -2325,8 +2378,11 @@ INDEX_HTML = r"""
     }
     @media (max-width: 760px) {
       html, body { width:100%; max-width:100%; overflow:hidden; }
-      .app { width:100vw; max-width:100vw; grid-template-columns:minmax(0,1fr); grid-template-rows:minmax(260px,42vh) minmax(0,1fr); }
+      .app { width:100vw; max-width:100vw; grid-template-columns:minmax(0,1fr); grid-template-rows:minmax(260px,42vh) minmax(0,1fr); transition: grid-template-rows var(--sidebar-duration) var(--sidebar-ease); }
+      .app.sidebar-collapsed { grid-template-rows:74px minmax(0,1fr); }
       .sidebar { width:100%; max-width:100vw; border-right:0; border-bottom:1px solid var(--line); padding:16px; }
+      .app.sidebar-collapsed .sidebar { padding:15px 16px; }
+      .sidebar > .section, .sidebar > form { min-width:calc(100vw - 32px); }
       .main { width:100%; max-width:100vw; padding:16px 12px 24px; }
       .actions { grid-template-columns:1fr; }
       .actions .brand { grid-column:auto !important; }
@@ -2337,6 +2393,11 @@ INDEX_HTML = r"""
       .pane { width:100%; max-width:100%; overflow-x:auto; }
       .pane table { min-width:680px; }
       .hero h1 { font-size:20px; }
+      .sidebar-toggle { top:42vh; left:50%; width:74px; height:16px; border-radius:0 0 8px 8px; transform:translate(-50%, 3px); }
+      .sidebar-toggle:active { transform:translate(-50%, 3px) scale(.94); }
+      .sidebar-toggle .toggle-chevron { transform:rotate(90deg); }
+      .app.sidebar-collapsed .sidebar-toggle { top:74px; }
+      .app.sidebar-collapsed .sidebar-toggle .toggle-chevron { transform:rotate(270deg); }
       .metric strong { font-size:24px; }
     }
     @media (max-width: 560px) { .assistant-panel { right: 12px; bottom: 84px; width: calc(100vw - 24px); height: min(600px, calc(100vh - 105px)); } .assistant-orb { right: 14px; bottom: 14px; } }
@@ -2391,6 +2452,11 @@ INDEX_HTML = r"""
         <div class="section" id="runFields"></div>
       </form>
     </aside>
+    <button class="sidebar-toggle" id="sidebarToggle" type="button" aria-label="收起左侧栏" aria-expanded="true" title="收起左侧栏">
+      <svg viewBox="0 0 20 24" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path class="toggle-chevron" d="M14.5 4.5 6.5 12l8 7.5"></path>
+      </svg>
+    </button>
     <main class="main">
       <div class="topbar">
         <div class="hero">
@@ -2580,6 +2646,8 @@ INDEX_HTML = r"""
     const assistantHistory = [];
     const metricCache = {};
     const REDUCED_MOTION = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const SIDEBAR_STORAGE_KEY = "mllm-console-sidebar-collapsed";
+    const SIDEBAR_SCROLL_STORAGE_KEY = "mllm-console-sidebar-scroll-top";
     function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
     // cosmetic per-line tint for the log terminal
     function logLineClass(line) {
@@ -3125,6 +3193,29 @@ INDEX_HTML = r"""
       setHistoryHint(historyDir ? `已回到实时数据 · 归档目录 ${historyDir}` : "已回到实时数据");
     }
     function wireEvents() {
+      const appShell = $(".app");
+      const sidebar = $(".sidebar");
+      const sidebarToggle = $("#sidebarToggle");
+      let sidebarScrollTop = 0;
+      try { sidebarScrollTop = Math.max(0, Number(localStorage.getItem(SIDEBAR_SCROLL_STORAGE_KEY)) || 0); } catch (error) { /* use top */ }
+      const setSidebarCollapsed = (collapsed, initializing = false) => {
+        if (collapsed && !initializing) {
+          sidebarScrollTop = sidebar.scrollTop;
+          try { localStorage.setItem(SIDEBAR_SCROLL_STORAGE_KEY, String(sidebarScrollTop)); } catch (error) { /* storage may be disabled */ }
+        }
+        appShell.classList.toggle("sidebar-collapsed", collapsed);
+        const toggleLabel = collapsed ? "展开左侧栏" : "收起左侧栏";
+        sidebarToggle.setAttribute("aria-expanded", String(!collapsed));
+        sidebarToggle.setAttribute("aria-label", toggleLabel);
+        sidebarToggle.title = toggleLabel;
+        try { localStorage.setItem(SIDEBAR_STORAGE_KEY, collapsed ? "1" : "0"); } catch (error) { /* storage may be disabled */ }
+        requestAnimationFrame(() => { sidebar.scrollTop = sidebarScrollTop; });
+      };
+      let sidebarCollapsed = false;
+      try { sidebarCollapsed = localStorage.getItem(SIDEBAR_STORAGE_KEY) === "1"; } catch (error) { /* use expanded default */ }
+      sidebar.scrollTop = sidebarScrollTop;
+      setSidebarCollapsed(sidebarCollapsed, true);
+      sidebarToggle.addEventListener("click", () => setSidebarCollapsed(!appShell.classList.contains("sidebar-collapsed")));
       $("#tabs").addEventListener("click", (event) => {
         const btn = event.target.closest(".tab");
         if (!btn) return;
