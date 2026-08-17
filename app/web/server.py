@@ -4,25 +4,23 @@ import argparse
 import json
 import os
 import posixpath
-import re
 import shlex
 import subprocess
 import sys
 import threading
 import time
-import urllib.error
-import urllib.request
 import webbrowser
 from pathlib import Path, PureWindowsPath
 from typing import Any
 
 from fastapi import Body, FastAPI
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from app.config import APP_DIR, AppConfig, load_config, save_config
 from app.models import CloneRequest
 from app.services.git_service import REPO_DIR_NAME, RemoteGitCloneService
 from app.services.ssh_client import SSHClientManager, parse_connection_command
+from app.web.agent_service import AgentService
 from app.web.risk_evaluation import (
     COT_WEIGHTS,
     calculate_capability_leakage,
@@ -130,23 +128,6 @@ HISTORY_DIR = APP_DIR / "history"
 HISTORY_LOG_LINES = 200          # cap stored logs so snapshots stay small
 SECRET_CONSOLE_KEYS = {"teacher_api_key", "judge_api_key", "assistant_api_key"}
 SECRET_FORM_KEY_HINT = "API_KEY"
-
-ASSISTANT_SYSTEM_PROMPT = """你是 MLLM 能力泄漏风险检测平台的内置 AI 助手，负责帮助用户理解和使用这个软件。
-
-回答原则：
-1. 使用简洁、准确的中文回答；用户询问参数时，说明它的作用、常见取值、对运行时间/显存/结果的影响。
-2. 只根据本平台的功能回答。不要假装已经运行任务、访问服务器文件或看到了用户没有提供的日志。
-3. 区分本地笔记本前端和远程服务器后端：路径、模型、数据集和检查点通常指服务器上的路径；配置和 API 密钥保存在前端所在电脑的本地配置中，SSH 连接认证仍由前端负责。
-4. 当前平台流程通常是：教师标注采集 -> 教师风险基线 -> Stage1 学生蒸馏 -> Stage2 学生蒸馏 -> 学生完整风险评估 -> 思维链评估 -> 风险报告聚合。用户启用“复用已有教师结果”时，对应教师阶段会跳过；复用的 JSON 必须位于服务器且文件存在。
-5. Debug 模式只模拟前端进度和日志，不执行真实后端实验；正常模式才通过 SSH 执行服务器上的脚本。历史记录是结果快照，不会重新运行任务。
-6. 教师采集的 TRAIN_NUM/MAX_SAMPLES 控制训练标注数量；SCIENCEQA_CONTROL_MAX_SAMPLES 控制教师风险基线控制集数量；EVAL_MAX_SAMPLES 控制学生风险评估数量；思维链评估的 SAMPLE_NUM 控制 judge 抽样数量。batch size 是每步样本数，显存不足优先减小它、增加梯度累积或启用 4bit/冻结视觉塔。
-7. 如果用户贴出报错，先指出最可能的阶段和直接原因，再给出前端可调整的参数或需要检查的服务器路径。不要建议修改 SSH 认证，除非用户明确要求。
-
-平台功能：左侧配置 SSH、路径、教师模型和运行参数；“一键跑完整 Pipeline”执行全流程；状态页显示阶段进度和终端日志；数据页管理教师结果复用；训练页配置 Stage1/Stage2；完整评测页运行学生评测和思维链 judge；风险大盘展示控制集对比和风险指标；水印检测页运行 z-mean 检测；历史测评数据可以归档、选择查看和删除。
-
-如果无法确定某个脚本的具体行为，明确说需要查看对应服务器日志或脚本，而不是编造结论。
-只输出最终答案，不要输出思考过程、分析过程、草稿、推理步骤或名为 Thinking Process 的内容；不要使用 <think> 标签。"""
-
 
 def _strip_secrets(console_vars: dict[str, Any], form_vars: dict[str, str]) -> tuple[dict[str, Any], dict[str, str]]:
     """Snapshots are plain files on disk: keep API keys out of them."""
@@ -356,7 +337,9 @@ def default_console_vars() -> dict[str, Any]:
         "judge_sample_num": 500,
         "assistant_api_base": os.environ.get("ASSISTANT_API_BASE", "https://api.openai.com/v1"),
         "assistant_api_key": os.environ.get("ASSISTANT_API_KEY", ""),
-        "assistant_model": os.environ.get("ASSISTANT_MODEL", "gpt-4o-mini"),
+        "assistant_model": os.environ.get("ASSISTANT_MODEL", "dpsk-v4-flash"),
+        "assistant_context_limit": 131072,
+        "assistant_reasoning": True,
         "wm_base_before_score": "",
         "wm_extracted_score": "",
         "wm_test_score": "",
@@ -499,6 +482,7 @@ class WebConsole:
         self.sim_completed: set[str] = set()
         self.sim_archive_pending = False
         self.save_app_config()
+        self.agent_service = AgentService(self)
 
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
@@ -1389,79 +1373,7 @@ class WebConsole:
         return {"ok": True, "message": "已删除该历史记录", "items": self.history_list()}
 
     def assistant_chat(self, payload: dict[str, Any]) -> dict[str, Any]:
-        with self.lock:
-            console = dict(self.console_vars)
-            form = dict(self.form_vars)
-        base_url = normalize_openai_base_url(str(console.get("assistant_api_base", "")))
-        api_key = str(console.get("assistant_api_key", "")).strip()
-        model = str(console.get("assistant_model", "gpt-4o-mini")).strip() or "gpt-4o-mini"
-        if not base_url:
-            return {"ok": False, "message": "尚未配置 AI 助手 Base URL"}
-        if not api_key:
-            return {"ok": False, "message": "尚未配置 AI 助手 API Key"}
-        raw_messages = payload.get("messages", []) if isinstance(payload, dict) else []
-        messages: list[dict[str, str]] = []
-        if isinstance(raw_messages, list):
-            for item in raw_messages[-12:]:
-                if not isinstance(item, dict) or item.get("role") not in {"user", "assistant"}:
-                    continue
-                content = str(item.get("content", "")).strip()
-                if content:
-                    messages.append({"role": str(item["role"]), "content": content[:4000]})
-        if not messages or messages[-1]["role"] != "user":
-            return {"ok": False, "message": "请输入问题后再发送"}
-        context = {
-            "dataset_name": console.get("dataset_name"),
-            "dataset_path": console.get("dataset_path"),
-            "model_path": console.get("model_path"),
-            "cuda_devices": console.get("cuda_devices"),
-            "teacher_model": console.get("victim_model"),
-            "train_num": form.get("TRAIN_NUM"),
-            "max_samples": form.get("MAX_SAMPLES"),
-            "control_max_samples": form.get("SCIENCEQA_CONTROL_MAX_SAMPLES"),
-            "eval_max_samples": form.get("EVAL_MAX_SAMPLES"),
-            "sample_num": console.get("judge_sample_num"),
-            "stage1_batch_size": form.get("STAGE1_BATCH_SIZE"),
-            "stage1_grad_accum": form.get("STAGE1_GRAD_ACCUM"),
-            "stage2_batch_size": form.get("PHASE_A_BATCH_SIZE"),
-            "stage2_grad_accum": form.get("STAGE2_GRAD_ACCUM"),
-            "use_4bit": form.get("USE_4BIT"),
-            "freeze_vision_tower": form.get("FREEZE_VISION_TOWER"),
-        }
-        system = ASSISTANT_SYSTEM_PROMPT + "\n\n当前前端配置上下文（仅用于解释，不要在回答中泄露 API Key）：\n" + json.dumps(context, ensure_ascii=False)
-        request_payload = {
-            "model": model,
-            "messages": [{"role": "system", "content": system}, *messages],
-            "temperature": 0.2,
-            "max_tokens": 900,
-            "reasoning": {"enabled": False},
-        }
-        request = urllib.request.Request(
-            base_url + "/chat/completions",
-            data=json.dumps(request_payload, ensure_ascii=False).encode("utf-8"),
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=90) as response:
-                result = json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")[:500]
-            return {"ok": False, "message": f"AI 助手请求失败（HTTP {exc.code}）：{detail}"}
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-            return {"ok": False, "message": f"AI 助手连接失败：{exc}"}
-        try:
-            message = result["choices"][0]["message"].get("content", "")
-            if isinstance(message, list):
-                message = "".join(str(part.get("text", "")) for part in message if isinstance(part, dict))
-            message = str(message).strip()
-            message = re.sub(r"<think(?:ing)?[^>]*>.*?</think(?:ing)?>", "", message, flags=re.IGNORECASE | re.DOTALL).strip()
-            if re.search(r"thinking\s+process\s*:", message, flags=re.IGNORECASE):
-                final = re.split(r"(?:final\s+answer|最终答案|答案)\s*:\s*", message, maxsplit=1, flags=re.IGNORECASE)
-                message = final[-1].strip() if len(final) > 1 else "模型返回了未隐藏的思考内容，请关闭模型的 thinking/reasoning 选项后重试。"
-        except (KeyError, IndexError, TypeError):
-            return {"ok": False, "message": "AI 助手返回格式无法识别"}
-        return {"ok": True, "message": message or "模型没有返回文本内容"}
+        return self.agent_service.chat(payload)
 
     def sim_sync_completed(self) -> set[str]:
         """Refresh (and return) the set of finished simulated steps."""
@@ -1790,6 +1702,30 @@ def create_app(debug: bool = False) -> FastAPI:
     @app.post("/api/assistant/chat")
     def assistant_chat(payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
         return console.assistant_chat(payload)
+
+    @app.post("/api/assistant/chat/stream")
+    def assistant_chat_stream(payload: dict[str, Any] = Body(default_factory=dict)) -> StreamingResponse:
+        return StreamingResponse(
+            console.agent_service.chat_stream(payload),
+            media_type="application/x-ndjson",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    @app.post("/api/assistant/actions/{action_id}/confirm")
+    def assistant_action_confirm(action_id: str, payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+        return console.agent_service.resolve_action(action_id, str(payload.get("session_id", "")), confirm=True)
+
+    @app.post("/api/assistant/actions/{action_id}/reject")
+    def assistant_action_reject(action_id: str, payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+        return console.agent_service.resolve_action(action_id, str(payload.get("session_id", "")), confirm=False)
+
+    @app.delete("/api/assistant/sessions/{session_id}")
+    def assistant_session_clear(session_id: str) -> dict[str, Any]:
+        return console.agent_service.clear_session(session_id)
+
+    @app.get("/api/assistant/sessions/{session_id}")
+    def assistant_session_get(session_id: str) -> dict[str, Any]:
+        return console.agent_service.get_session(session_id)
 
     return app
 
@@ -2334,20 +2270,37 @@ INDEX_HTML = r"""
     .assistant-orb.dragging { cursor: grabbing; transition: none; transform: scale(1.04); }
     .assistant-orb.assistant-hidden { opacity: 0; pointer-events: none; transform: scale(.72); }
     .assistant-orb svg { width: 29px; height: 29px; display: block; transform: translate(0, 2px); pointer-events: none; }
-    .assistant-panel { position: fixed; z-index: 1190; right: 22px; bottom: 94px; width: min(410px, calc(100vw - 32px)); height: min(610px, calc(100vh - 120px)); display: flex; flex-direction: column; overflow: hidden; border: 1px solid var(--line); border-radius: 16px; background: rgba(255,255,255,.97); box-shadow: 0 18px 50px rgba(23,54,110,.22); opacity: 0; pointer-events: none; transform: translateY(12px) scale(.98); transition: opacity .18s ease, transform .18s ease; }
+    .assistant-panel { position: fixed; z-index: 1190; right: 22px; bottom: 24px; width: min(512px, calc(100vw - 32px)); height: min(762px, calc(100vh - 48px)); min-width: min(340px, calc(100vw - 16px)); min-height: min(420px, calc(100vh - 16px)); display: flex; flex-direction: column; overflow: hidden; border: 1px solid var(--line); border-radius: 16px; background: rgba(255,255,255,.97); box-shadow: 0 18px 50px rgba(23,54,110,.22); opacity: 0; pointer-events: none; transform: translateY(12px) scale(.98); transition: opacity .18s ease, transform .18s ease; }
     .assistant-panel.open { opacity: 1; pointer-events: auto; transform: translateY(0) scale(1); }
     .assistant-panel.closing { opacity: 1; pointer-events: none; transform: none; transition: none; }
     .assistant-panel.opening { pointer-events: none; transition: none; }
     .assistant-orb.assistant-morph-target { opacity: 0; pointer-events: none; transform: scale(.827586); }
     .assistant-head { display: flex; align-items: center; gap: 10px; padding: 14px 15px; border-bottom: 1px solid var(--line); background: linear-gradient(135deg, #f8fbff, #eef5ff); cursor: grab; user-select: none; touch-action: none; }
     .assistant-panel.dragging .assistant-head { cursor: grabbing; }
+    .assistant-panel.resizing { user-select: none; }
+    .assistant-resize-handle { position: absolute; z-index: 25; display: block; touch-action: none; }
+    .assistant-resize-handle[data-resize="n"] { top: 0; left: 12px; right: 12px; height: 7px; cursor: ns-resize; }
+    .assistant-resize-handle[data-resize="s"] { bottom: 0; left: 12px; right: 12px; height: 7px; cursor: ns-resize; }
+    .assistant-resize-handle[data-resize="e"] { top: 12px; right: 0; bottom: 12px; width: 7px; cursor: ew-resize; }
+    .assistant-resize-handle[data-resize="w"] { top: 12px; left: 0; bottom: 12px; width: 7px; cursor: ew-resize; }
+    .assistant-resize-handle[data-resize="ne"] { top: 0; right: 0; width: 13px; height: 13px; cursor: nesw-resize; }
+    .assistant-resize-handle[data-resize="nw"] { top: 0; left: 0; width: 13px; height: 13px; cursor: nwse-resize; }
+    .assistant-resize-handle[data-resize="se"] { right: 0; bottom: 0; width: 13px; height: 13px; cursor: nwse-resize; }
+    .assistant-resize-handle[data-resize="sw"] { left: 0; bottom: 0; width: 13px; height: 13px; cursor: nesw-resize; }
     .assistant-head strong { flex: 1; font-family: var(--display); font-size: 14px; }
     .assistant-head small { color: var(--muted); font-size: 11px; }
     .assistant-icon { width: 30px; height: 30px; display: grid; place-items: center; border-radius: 10px; background: var(--accent-soft); color: var(--accent-2); font-weight: 800; }
     .assistant-icon-btn { width: 30px; height: 30px; padding: 0; border: 1px solid var(--line); border-radius: 8px; background: #fff; color: var(--muted); cursor: pointer; }
     .assistant-icon-btn:hover { color: var(--accent-2); border-color: var(--accent-3); }
+    .assistant-modebar { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 14px; border-bottom: 1px solid var(--line); background: #fff; }
+    .assistant-mode-switch { position: relative; display: grid; grid-template-columns: 1fr 1fr; width: 150px; padding: 2px; overflow: hidden; border: 1px solid var(--line); border-radius: 8px; background: #f3f6fb; }
+    .assistant-mode-switch::before { content: ""; position: absolute; z-index: 0; top: 2px; bottom: 2px; left: 2px; width: calc(50% - 2px); border-radius: 6px; background: #fff; box-shadow: 0 1px 4px rgba(23,54,110,.14); transform: translateX(0); transition: transform .3s cubic-bezier(.22,.75,.25,1); }
+    .assistant-mode-switch.agent-active::before { transform: translateX(100%); }
+    .assistant-mode-btn { position: relative; z-index: 1; min-height: 28px; border: 0; border-radius: 6px; background: transparent; color: var(--muted); font-size: 11px; font-weight: 700; cursor: pointer; transition: color .22s ease; }
+    .assistant-mode-btn.active { color: var(--accent-2); }
+    .assistant-mode-note { color: var(--muted); font-size: 10.5px; }
     .assistant-messages { flex: 1; min-height: 0; overflow-y: auto; padding: 14px; background: #f8fbff; }
-    .assistant-msg { max-width: 88%; margin: 0 0 11px; padding: 10px 12px; border-radius: 11px; font-size: 12.5px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .assistant-msg { width: fit-content; min-width: 0; max-width: 88%; margin: 0 0 11px; padding: 10px 12px; border-radius: 11px; font-size: 12.5px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
     .assistant-msg.assistant { margin-right: auto; border: 1px solid var(--line); background: #fff; color: var(--text); white-space: normal; }
     .assistant-msg.user { margin-left: auto; background: var(--accent-2); color: #fff; }
     .assistant-msg.assistant p { margin: 0 0 7px; }
@@ -2357,6 +2310,40 @@ INDEX_HTML = r"""
     .assistant-msg.assistant code { padding: 1px 4px; border-radius: 4px; background: #edf3ff; color: #174ea6; font-family: var(--mono); font-size: 11.5px; }
     .assistant-msg.assistant pre { margin: 7px 0 2px; padding: 9px 10px; overflow-x: auto; border-radius: 7px; background: #0d1b30; color: #dbeafe; font-family: var(--mono); font-size: 11px; line-height: 1.5; white-space: pre; }
     .assistant-msg.assistant pre code { padding: 0; background: transparent; color: inherit; }
+    .assistant-paragraph-gap { height: 7px; }
+    .assistant-answer:empty::after { content: "Thinking..."; display: inline-block; color: var(--muted); font-family: var(--mono); font-size: 11px; animation: assistantThinkingDots 1.8s steps(1,end) infinite, assistantThinkingHop .72s ease-in-out infinite; }
+    @keyframes assistantThinkingDots {
+      0%, 14% { content: "Thinking..."; }
+      15%, 29% { content: "Thinking...."; }
+      30%, 44% { content: "Thinking....."; }
+      45%, 59% { content: "Thinking......"; }
+      60%, 74% { content: "Thinking....."; }
+      75%, 89% { content: "Thinking...."; }
+      90%, 100% { content: "Thinking..."; }
+    }
+    @keyframes assistantThinkingHop { 0%, 100% { transform: translateY(0); } 42% { transform: translateY(-2px); } 68% { transform: translateY(1px); } }
+    .assistant-reasoning { margin: 0 0 9px; border-bottom: 1px solid var(--line); padding-bottom: 7px; color: var(--muted); }
+    .assistant-reasoning summary { cursor: pointer; font-size: 11px; font-weight: 700; color: #5c7293; }
+    .assistant-reasoning-body { max-height: 190px; margin-top: 6px; overflow: auto; white-space: pre-wrap; font-family: var(--mono); font-size: 10.5px; line-height: 1.55; }
+    .assistant-table-wrap { width: 100%; margin: 8px 0; overflow-x: auto; border: 1px solid var(--line); border-radius: 7px; }
+    .assistant-msg.assistant table { width: 100%; border-collapse: collapse; background: #fff; font-size: 11px; line-height: 1.45; }
+    .assistant-msg.assistant th, .assistant-msg.assistant td { min-width: 76px; padding: 7px 8px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    .assistant-msg.assistant th { background: #f3f6fb; color: var(--text); font-weight: 700; }
+    .assistant-msg.assistant tr:last-child td { border-bottom: 0; }
+    .assistant-msg.assistant th:last-child, .assistant-msg.assistant td:last-child { border-right: 0; }
+    .assistant-tools { display: grid; gap: 6px; margin-top: 9px; }
+    .assistant-tool { display: grid; grid-template-columns: 8px minmax(0,1fr); gap: 7px; align-items: start; padding: 7px 8px; border: 1px solid var(--line); border-radius: 7px; background: #f8fbff; font-size: 10.5px; color: var(--muted); }
+    .assistant-tool::before { content: ""; width: 7px; height: 7px; margin-top: 4px; border-radius: 50%; background: #8ba0bd; }
+    .assistant-tool.completed::before { background: var(--ok); }
+    .assistant-tool.failed::before { background: var(--bad); }
+    .assistant-tool.pending::before { background: var(--warn); }
+    .assistant-tool strong { display: block; color: var(--text); font-size: 10.5px; }
+    .assistant-action { margin-top: 9px; padding: 10px; border: 1px solid rgba(217,119,6,.35); border-radius: 8px; background: #fffbeb; }
+    .assistant-action strong { display: block; margin-bottom: 3px; color: #92400e; font-size: 11.5px; }
+    .assistant-action p { margin: 0 0 8px; color: #7c5b19; font-size: 10.5px; }
+    .assistant-action-buttons { display: flex; gap: 7px; }
+    .assistant-action-buttons .btn { min-height: 30px; padding: 6px 10px; font-size: 10.5px; }
+    .assistant-action.resolved { border-color: var(--line); background: #f3f6fb; }
     .assistant-settings { display: none; padding: 10px 14px; border-bottom: 1px solid var(--line); background: #fff; }
     .assistant-settings.open { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
     .assistant-settings .field { margin: 0; }
@@ -2403,7 +2390,7 @@ INDEX_HTML = r"""
       .app.sidebar-collapsed .sidebar-toggle .toggle-chevron { transform:rotate(270deg); }
       .metric strong { font-size:24px; }
     }
-    @media (max-width: 560px) { .assistant-panel { right: 12px; bottom: 84px; width: calc(100vw - 24px); height: min(600px, calc(100vh - 105px)); } .assistant-orb { right: 14px; top: 40%; } }
+    @media (max-width: 560px) { .assistant-panel { right: 12px; bottom: 12px; width: calc(100vw - 24px); height: calc(100vh - 24px); min-width: 0; min-height: 360px; } .assistant-orb { right: 14px; top: 40%; } }
   </style>
 </head>
 <body>
@@ -2619,19 +2606,36 @@ INDEX_HTML = r"""
         <span class="assistant-icon">AI</span>
         <strong>平台 AI 助手</strong>
         <small id="assistantModelLabel">未配置</small>
+        <button class="assistant-icon-btn" id="assistantClearBtn" type="button" title="清空当前会话">↺</button>
         <button class="assistant-icon-btn" id="assistantSettingsBtn" type="button" title="助手设置">⚙</button>
         <button class="assistant-icon-btn" id="assistantCloseBtn" type="button" title="关闭">×</button>
       </div>
+      <div class="assistant-modebar">
+        <div class="assistant-mode-switch" role="tablist" aria-label="助手模式">
+          <button class="assistant-mode-btn active" type="button" data-assistant-mode="ask" role="tab" aria-selected="true">Ask</button>
+          <button class="assistant-mode-btn" type="button" data-assistant-mode="agent" role="tab" aria-selected="false">Agent</button>
+        </div>
+        <span class="assistant-mode-note" id="assistantModeNote">仅问答</span>
+      </div>
       <div class="assistant-settings" id="assistantSettings">
         <div class="field"><label>Base URL</label><input data-console="assistant_api_base" placeholder="https://api.openai.com/v1"></div>
-        <div class="field"><label>模型</label><input data-console="assistant_model" placeholder="gpt-4o-mini"></div>
+        <div class="field"><label>模型</label><input data-console="assistant_model" placeholder="dpsk-v4-flash"></div>
         <div class="field"><label>API Key</label><input type="password" data-console="assistant_api_key" placeholder="sk-..."></div>
+        <label class="reuse-check"><input class="reuse-toggle" type="checkbox" data-console="assistant_reasoning">启用思考</label>
       </div>
-      <div class="assistant-messages" id="assistantMessages"><div class="assistant-msg assistant">你好，我可以帮你解答平台功能、参数含义、运行流程和常见报错。请直接描述你的问题。</div></div>
+      <div class="assistant-messages" id="assistantMessages"><div class="assistant-msg assistant">你好，我可以解答平台问题，也可以在 Agent 模式下调整参数并规划实验。</div></div>
       <form class="assistant-compose" id="assistantForm">
         <textarea id="assistantInput" rows="1" placeholder="询问平台用法或参数..."></textarea>
         <button class="btn primary assistant-send" id="assistantSendBtn" type="submit">发送</button>
       </form>
+      <i class="assistant-resize-handle" data-resize="n" aria-hidden="true"></i>
+      <i class="assistant-resize-handle" data-resize="ne" aria-hidden="true"></i>
+      <i class="assistant-resize-handle" data-resize="e" aria-hidden="true"></i>
+      <i class="assistant-resize-handle" data-resize="se" aria-hidden="true"></i>
+      <i class="assistant-resize-handle" data-resize="s" aria-hidden="true"></i>
+      <i class="assistant-resize-handle" data-resize="sw" aria-hidden="true"></i>
+      <i class="assistant-resize-handle" data-resize="w" aria-hidden="true"></i>
+      <i class="assistant-resize-handle" data-resize="nw" aria-hidden="true"></i>
     </section>
   </div>
   <script>
@@ -2646,7 +2650,16 @@ INDEX_HTML = r"""
     let historyItems = [];
     let historyDir = "";
     let suppressSave = false;      // true while programmatically filling inputs
-    const assistantHistory = [];
+    const ASSISTANT_SESSION_KEY = "mllm-console-assistant-session";
+    const ASSISTANT_MODE_KEY = "mllm-console-assistant-mode";
+    const makeAssistantSessionId = () => (crypto.randomUUID ? crypto.randomUUID().replaceAll("-", "") : `${Date.now()}_${Math.random().toString(36).slice(2)}`);
+    let assistantSessionId = "";
+    let assistantMode = "ask";
+    try {
+      assistantSessionId = localStorage.getItem(ASSISTANT_SESSION_KEY) || makeAssistantSessionId();
+      assistantMode = localStorage.getItem(ASSISTANT_MODE_KEY) === "agent" ? "agent" : "ask";
+      localStorage.setItem(ASSISTANT_SESSION_KEY, assistantSessionId);
+    } catch (error) { assistantSessionId = makeAssistantSessionId(); }
     const metricCache = {};
     const REDUCED_MOTION = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     const SIDEBAR_STORAGE_KEY = "mllm-console-sidebar-collapsed";
@@ -2739,7 +2752,12 @@ INDEX_HTML = r"""
       if (data.config) state = data.config;
     }
     async function saveAssistantConfig() {
-      const data = await post("/api/config", collectPayload());
+      clearTimeout(window.__assistantSaveTimer);
+      const consoleVars = {};
+      $$("#assistantSettings [data-console]").forEach(el => {
+        consoleVars[el.dataset.console] = el.type === "checkbox" ? (el.checked ? "1" : "0") : el.value;
+      });
+      const data = await post("/api/config", { console_vars: consoleVars });
       if (data.config) {
         state = data.config;
         const model = data.config.console_vars?.assistant_model || "未配置";
@@ -2758,31 +2776,127 @@ INDEX_HTML = r"""
       $("#assistantModelLabel")?.replaceChildren(document.createTextNode(assistantModel));
       renderPipeline(data.pipeline || {});
     }
-    function appendAssistantMessage(role, content) {
+    function appendAssistantMessage(role, content, options = {}) {
       const box = $("#assistantMessages");
       const message = document.createElement("div");
       message.className = `assistant-msg ${role}`;
-      message[role === "assistant" ? "innerHTML" : "textContent"] = role === "assistant" ? renderAssistantMarkdown(content) : content;
+      if (role === "assistant") {
+        const answer = document.createElement("div");
+        answer.className = "assistant-answer";
+        answer.innerHTML = renderAssistantMarkdown(content);
+        message.appendChild(answer);
+        setAssistantReasoning(message, options.reasoning || "", false);
+        renderAssistantTools(message, options.toolEvents || []);
+        renderAssistantAction(message, options.pendingAction);
+      } else {
+        message.textContent = content;
+      }
       box.appendChild(message);
       box.scrollTop = box.scrollHeight;
+      return message;
+    }
+    function setAssistantReasoning(message, content, streaming) {
+      let details = message.querySelector(".assistant-reasoning");
+      if (!content) {
+        if (!streaming) details?.remove();
+        return details;
+      }
+      if (!details) {
+        details = document.createElement("details");
+        details.className = "assistant-reasoning";
+        details.innerHTML = '<summary></summary><div class="assistant-reasoning-body"></div>';
+        message.insertBefore(details, message.querySelector(".assistant-answer"));
+      }
+      details.querySelector("summary").textContent = streaming ? "正在思考..." : "查看思考过程";
+      details.querySelector(".assistant-reasoning-body").textContent = content;
+      if (streaming) details.open = true;
+      else details.open = false;
+      return details;
+    }
+    function renderAssistantTools(message, events) {
+      message.querySelector(".assistant-tools")?.remove();
+      if (!events?.length) return;
+      const tools = document.createElement("div");
+      tools.className = "assistant-tools";
+      events.forEach(event => {
+        const item = document.createElement("div");
+        item.className = `assistant-tool ${event.status || "completed"}`;
+        const text = document.createElement("div");
+        const name = document.createElement("strong");
+        name.textContent = event.name || "tool";
+        text.appendChild(name);
+        if (event.summary) text.appendChild(document.createTextNode(event.summary));
+        item.appendChild(text);
+        tools.appendChild(item);
+      });
+      message.appendChild(tools);
+    }
+    function renderAssistantAction(message, action) {
+      message.querySelector(".assistant-action")?.remove();
+      if (!action) return;
+      const card = document.createElement("div");
+      card.className = "assistant-action";
+      card.dataset.actionId = action.action_id;
+      card.innerHTML = `<strong>${escapeHtml(action.title || "等待确认")}</strong><p>${escapeHtml(action.detail || "")}</p>`;
+      const buttons = document.createElement("div");
+      buttons.className = "assistant-action-buttons";
+      buttons.innerHTML = `<button class="btn primary" type="button" data-agent-action="confirm">确认执行</button><button class="btn" type="button" data-agent-action="reject">取消</button>`;
+      card.appendChild(buttons);
+      message.appendChild(card);
+    }
+    function renderMarkdownTables(text) {
+      const lines = text.split("\n"), output = [];
+      const cells = line => line.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map(cell => cell.trim());
+      const separator = line => {
+        const parts = cells(line);
+        return parts.length > 0 && parts.every(cell => /^:?-{3,}:?$/.test(cell));
+      };
+      for (let index = 0; index < lines.length;) {
+        if (index + 1 < lines.length && lines[index].includes("|") && separator(lines[index + 1])) {
+          const headers = cells(lines[index]);
+          const rows = [];
+          index += 2;
+          while (index < lines.length && lines[index].includes("|") && lines[index].trim()) {
+            const row = cells(lines[index]);
+            while (row.length < headers.length) row.push("");
+            rows.push(row.slice(0, headers.length));
+            index += 1;
+          }
+          const head = headers.map(cell => `<th>${cell}</th>`).join("");
+          const body = rows.map(row => `<tr>${row.map(cell => `<td>${cell}</td>`).join("")}</tr>`).join("");
+          output.push(`<div class="assistant-table-wrap"><table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`);
+        } else {
+          output.push(lines[index]);
+          index += 1;
+        }
+      }
+      return output.join("\n");
     }
     function renderAssistantMarkdown(source) {
       let text = escapeHtml(String(source || ""));
-      const codeBlocks = [];
-      text = text.replace(/```(?:[a-zA-Z0-9_+-]+)?\n?([\s\S]*?)```/g, (_, code) => {
-        const token = `@@ASSISTANT_CODE_${codeBlocks.length}@@`;
-        codeBlocks.push(`<pre><code>${code.trimEnd()}</code></pre>`);
+      const blocks = [];
+      const stashBlock = html => {
+        const token = `@@ASSISTANT_BLOCK_${blocks.length}@@`;
+        blocks.push(html);
         return token;
+      };
+      text = text.replace(/```(?:[a-zA-Z0-9_+-]+)?\n?([\s\S]*?)```/g, (_, code) => {
+        return stashBlock(`<pre><code>${code.trimEnd()}</code></pre>`);
       });
+      text = renderMarkdownTables(text);
+      text = text.replace(/<div class="assistant-table-wrap">[\s\S]*?<\/div>/g, table => stashBlock(table));
       text = text.replace(/^###\s+(.+)$/gm, "<strong>$1</strong>");
       text = text.replace(/^##\s+(.+)$/gm, "<strong>$1</strong>");
       text = text.replace(/^#\s+(.+)$/gm, "<strong>$1</strong>");
       text = text.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
       text = text.replace(/`([^`\n]+)`/g, "<code>$1</code>");
       text = text.replace(/^\s*[-*]\s+(.+)$/gm, "<li>$1</li>");
-      text = text.replace(/((?:<li>.*<\/li>\n?)+)/g, "<ul>$1</ul>");
+      text = text.replace(/((?:<li>.*<\/li>\n?)+)/g, items => stashBlock(`<ul>${items}</ul>`));
+      text = text.replace(/\n*(@@ASSISTANT_BLOCK_\d+@@)\n*/g, "$1");
+      text = text.trim().replace(/\n{2,}/g, "@@ASSISTANT_PARAGRAPH_GAP@@");
       text = text.replace(/\n/g, "<br>");
-      codeBlocks.forEach((block, index) => { text = text.replace(`@@ASSISTANT_CODE_${index}@@`, block); });
+      text = text.replace(/@@ASSISTANT_PARAGRAPH_GAP@@/g, '<div class="assistant-paragraph-gap" aria-hidden="true"></div>');
+      blocks.forEach((block, index) => { text = text.replace(`@@ASSISTANT_BLOCK_${index}@@`, block); });
       return text;
     }
     async function sendAssistantMessage() {
@@ -2790,31 +2904,140 @@ INDEX_HTML = r"""
       const send = $("#assistantSendBtn");
       const content = input.value.trim();
       if (!content || send.disabled) return;
-      assistantHistory.push({ role: "user", content });
       appendAssistantMessage("user", content);
       input.value = "";
       send.disabled = true;
+      let streamMessage = null;
       try {
         await saveAssistantConfig();
-        const response = await fetch("/api/assistant/chat", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ messages: assistantHistory }) });
-        const data = await response.json();
-        if (!data.ok) throw new Error(data.message || "助手请求失败");
-        assistantHistory.push({ role: "assistant", content: data.message });
-        appendAssistantMessage("assistant", data.message);
+        const response = await fetch("/api/assistant/chat/stream", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mode: assistantMode, session_id: assistantSessionId, history_view: Boolean(historyId), messages: [{ role: "user", content }] }) });
+        if (!response.ok || !response.body) throw new Error(`流式请求失败（HTTP ${response.status}）`);
+        streamMessage = appendAssistantMessage("assistant", "");
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "", answer = "", reasoning = "", finalData = null;
+        const toolEvents = [];
+        const handleEvent = event => {
+          const box = $("#assistantMessages");
+          const shouldFollow = box.scrollTop + box.clientHeight >= box.scrollHeight - 80;
+          if (event.type === "meta" && event.session_id) {
+            assistantSessionId = event.session_id;
+            try { localStorage.setItem(ASSISTANT_SESSION_KEY, assistantSessionId); } catch (error) { /* storage may be disabled */ }
+          } else if (event.type === "reasoning_delta") {
+            reasoning += event.delta || "";
+            setAssistantReasoning(streamMessage, reasoning, true);
+          } else if (event.type === "answer_delta") {
+            answer += event.delta || "";
+            const details = streamMessage.querySelector(".assistant-reasoning");
+            if (details) { details.open = false; details.querySelector("summary").textContent = "查看思考过程"; }
+            streamMessage.querySelector(".assistant-answer").innerHTML = renderAssistantMarkdown(answer);
+          } else if (event.type === "tool") {
+            toolEvents.push(event.event || {});
+            renderAssistantTools(streamMessage, toolEvents);
+          } else if (event.type === "done") {
+            finalData = event.response;
+          } else if (event.type === "error") {
+            throw new Error(event.message || "助手请求失败");
+          }
+          if (shouldFollow) box.scrollTop = box.scrollHeight;
+        };
+        while (true) {
+          const { value, done } = await reader.read();
+          buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+          const lines = buffer.split("\n");
+          buffer = lines.pop() || "";
+          lines.filter(Boolean).forEach(line => handleEvent(JSON.parse(line)));
+          if (done) break;
+        }
+        if (buffer.trim()) handleEvent(JSON.parse(buffer));
+        if (!finalData?.ok) throw new Error(finalData?.message || "流式响应未正常结束");
+        const answerNode = streamMessage.querySelector(".assistant-answer");
+        answerNode.innerHTML = renderAssistantMarkdown(finalData.message || answer);
+        setAssistantReasoning(streamMessage, finalData.reasoning || reasoning, false);
+        renderAssistantTools(streamMessage, finalData.tool_events || toolEvents);
+        renderAssistantAction(streamMessage, finalData.pending_action);
+        if (finalData.config && !historyId) {
+          clearTimeout(window.__saveTimer);
+          suppressSave = true;
+          applyConfig(finalData.config);
+          suppressSave = false;
+        }
+        if (finalData.pipeline) renderPipeline(finalData.pipeline);
       } catch (error) {
-        appendAssistantMessage("assistant", `请求失败：${error.message || error}`);
+        const failure = `请求失败：${error.message || error}`;
+        if (streamMessage) streamMessage.querySelector(".assistant-answer").textContent = failure;
+        else appendAssistantMessage("assistant", failure);
       } finally {
         send.disabled = false;
         input.focus();
       }
     }
+    function setAssistantMode(mode) {
+      assistantMode = mode === "agent" ? "agent" : "ask";
+      $(".assistant-mode-switch").classList.toggle("agent-active", assistantMode === "agent");
+      $$('[data-assistant-mode]').forEach(button => {
+        const active = button.dataset.assistantMode === assistantMode;
+        button.classList.toggle("active", active);
+        button.setAttribute("aria-selected", String(active));
+      });
+      $("#assistantModeNote").textContent = assistantMode === "agent" ? "可调用平台工具" : "仅问答";
+      $("#assistantInput").placeholder = assistantMode === "agent" ? "描述要修改的参数或要运行的实验..." : "询问平台用法或参数...";
+      try { localStorage.setItem(ASSISTANT_MODE_KEY, assistantMode); } catch (error) { /* storage may be disabled */ }
+    }
+    async function resolveAssistantAction(card, decision) {
+      if (historyId && decision === "confirm") {
+        card.querySelector("p").textContent = "当前正在查看历史归档，请返回实时数据后再确认执行";
+        return;
+      }
+      const actionId = card.dataset.actionId;
+      const buttons = [...card.querySelectorAll("button")];
+      buttons.forEach(button => { button.disabled = true; });
+      try {
+        const response = await fetch(`/api/assistant/actions/${encodeURIComponent(actionId)}/${decision}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ session_id: assistantSessionId }),
+        });
+        const data = await response.json();
+        card.classList.add("resolved");
+        const detail = card.querySelector("p");
+        detail.textContent = data.message || (data.ok ? (decision === "confirm" ? "操作已提交" : "已取消") : "操作失败");
+        card.querySelector(".assistant-action-buttons")?.remove();
+        if (data.config && !historyId) applyConfig(data.config);
+        if (data.pipeline) { renderPipeline(data.pipeline); startPolling(); }
+      } catch (error) {
+        buttons.forEach(button => { button.disabled = false; });
+        const detail = card.querySelector("p");
+        detail.textContent = `请求失败：${error.message || error}`;
+      }
+    }
+    async function restoreAssistantSession() {
+      try {
+        const response = await fetch(`/api/assistant/sessions/${encodeURIComponent(assistantSessionId)}`);
+        const data = await response.json();
+        if (!data.ok || !data.messages?.length) return;
+        const box = $("#assistantMessages");
+        box.replaceChildren();
+        data.messages.forEach(item => {
+          appendAssistantMessage(item.role, item.content, { reasoning: item.reasoning, toolEvents: item.tool_events, pendingAction: item.pending_action });
+        });
+      } catch (error) { /* start with the greeting */ }
+    }
+    async function clearAssistantSession() {
+      await fetch(`/api/assistant/sessions/${encodeURIComponent(assistantSessionId)}`, { method: "DELETE" });
+      assistantSessionId = makeAssistantSessionId();
+      try { localStorage.setItem(ASSISTANT_SESSION_KEY, assistantSessionId); } catch (error) { /* storage may be disabled */ }
+      $("#assistantMessages").innerHTML = '<div class="assistant-msg assistant">当前会话已清空。</div>';
+    }
     function wireAssistant() {
       const orb = $("#assistantOrb");
       const panel = $("#assistantPanel");
       const assistantHead = panel.querySelector(".assistant-head");
+      const resizeHandles = Array.from(panel.querySelectorAll(".assistant-resize-handle"));
       const orbIcon = orb.querySelector("svg");
       let orbDrag = null;
       let panelDrag = null;
+      let panelResize = null;
       let closeTimer = null;
       let orbRevealTimer = null;
       let panelMorphAnimation = null;
@@ -3095,8 +3318,94 @@ INDEX_HTML = r"""
       };
       assistantHead.addEventListener("pointerup", finishPanelDrag);
       assistantHead.addEventListener("pointercancel", finishPanelDrag);
+      resizeHandles.forEach(handle => {
+        handle.addEventListener("pointerdown", event => {
+          if (!panel.classList.contains("open") || panel.classList.contains("opening") || panel.classList.contains("closing")) return;
+          const rect = panel.getBoundingClientRect();
+          panelResize = {
+            id: event.pointerId,
+            direction: handle.dataset.resize || "se",
+            startX: event.clientX,
+            startY: event.clientY,
+            left: rect.left,
+            top: rect.top,
+            width: rect.width,
+            height: rect.height,
+          };
+          panel.style.left = rect.left + "px";
+          panel.style.top = rect.top + "px";
+          panel.style.right = "auto";
+          panel.style.bottom = "auto";
+          panel.style.width = rect.width + "px";
+          panel.style.height = rect.height + "px";
+          handle.setPointerCapture(event.pointerId);
+          panel.classList.add("resizing");
+          event.preventDefault();
+          event.stopPropagation();
+        });
+        handle.addEventListener("pointermove", event => {
+          if (!panelResize || panelResize.id !== event.pointerId) return;
+          const dx = event.clientX - panelResize.startX;
+          const dy = event.clientY - panelResize.startY;
+          const direction = panelResize.direction;
+          const minWidth = Math.min(340, window.innerWidth - 16);
+          const minHeight = Math.min(420, window.innerHeight - 16);
+          let left = panelResize.left;
+          let top = panelResize.top;
+          let width = panelResize.width;
+          let height = panelResize.height;
+          if (direction.includes("e")) {
+            width = clamp(panelResize.width + dx, minWidth, window.innerWidth - panelResize.left - 8);
+          }
+          if (direction.includes("w")) {
+            const right = panelResize.left + panelResize.width;
+            left = clamp(panelResize.left + dx, 8, right - minWidth);
+            width = right - left;
+          }
+          if (direction.includes("s")) {
+            height = clamp(panelResize.height + dy, minHeight, window.innerHeight - panelResize.top - 8);
+          }
+          if (direction.includes("n")) {
+            const bottom = panelResize.top + panelResize.height;
+            top = clamp(panelResize.top + dy, 8, bottom - minHeight);
+            height = bottom - top;
+          }
+          panel.style.left = left + "px";
+          panel.style.top = top + "px";
+          panel.style.width = width + "px";
+          panel.style.height = height + "px";
+        });
+        const finishResize = event => {
+          if (!panelResize || panelResize.id !== event.pointerId) return;
+          handle.releasePointerCapture(event.pointerId);
+          panel.classList.remove("resizing");
+          panelResize = null;
+        };
+        handle.addEventListener("pointerup", finishResize);
+        handle.addEventListener("pointercancel", finishResize);
+      });
+      window.addEventListener("resize", () => {
+        if (!panel.classList.contains("open")) return;
+        const rect = panel.getBoundingClientRect();
+        const width = Math.min(rect.width, window.innerWidth - 16);
+        const height = Math.min(rect.height, window.innerHeight - 16);
+        panel.style.width = width + "px";
+        panel.style.height = height + "px";
+        panel.style.left = clamp(rect.left, 8, window.innerWidth - width - 8) + "px";
+        panel.style.top = clamp(rect.top, 8, window.innerHeight - height - 8) + "px";
+        panel.style.right = "auto";
+        panel.style.bottom = "auto";
+      });
       $("#assistantCloseBtn").addEventListener("click", () => setAssistantOpen(false));
+      $("#assistantClearBtn").addEventListener("click", clearAssistantSession);
       $("#assistantSettingsBtn").addEventListener("click", () => $("#assistantSettings").classList.toggle("open"));
+      $$('[data-assistant-mode]').forEach(button => button.addEventListener("click", () => setAssistantMode(button.dataset.assistantMode)));
+      $("#assistantMessages").addEventListener("click", event => {
+        const button = event.target.closest("[data-agent-action]");
+        const card = button?.closest(".assistant-action");
+        if (button && card) resolveAssistantAction(card, button.dataset.agentAction);
+      });
+      setAssistantMode(assistantMode);
       $("#assistantForm").addEventListener("submit", event => { event.preventDefault(); sendAssistantMessage(); });
       $("#assistantInput").addEventListener("keydown", event => {
         if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); sendAssistantMessage(); }
@@ -3415,7 +3724,9 @@ INDEX_HTML = r"""
       document.body.classList.add("history-view");
       setActionsLocked(true);
       suppressSave = true;                   // filling inputs must not overwrite live config
-      $$("[data-console]").forEach(el => setInputValue(el, rec.console_vars?.[el.dataset.console]));
+      $$("[data-console]").forEach(el => {
+        if (!el.closest("#assistantSettings")) setInputValue(el, rec.console_vars?.[el.dataset.console]);
+      });
       $$("[data-form]").forEach(el => setInputValue(el, rec.form_vars?.[el.dataset.form]));
       suppressSave = false;
       renderDashboard(rec.dashboard || {});
@@ -3552,6 +3863,7 @@ INDEX_HTML = r"""
       wireAssistant();
       const res = await fetch("/api/config");
       applyConfig(await res.json());
+      await restoreAssistantSession();
       await refreshDashboard();
       await refreshWatermark();
       await loadHistoryList(null);

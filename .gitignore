@@ -6,3 +6,6 @@ dist/
 *.spec.bak
 CISCN-MICAD/
 test/
+!test/
+test/*
+!test/test_agent.py
