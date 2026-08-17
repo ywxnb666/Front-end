@@ -24,6 +24,7 @@ from app.web.agent_service import AgentService
 from app.web.risk_evaluation import (
     COT_WEIGHTS,
     calculate_capability_leakage,
+    calculate_watermark_fading_risk,
     calculate_watermark_erosion,
     extract_baseline_accuracy,
     extract_control_summary,
@@ -343,6 +344,9 @@ def default_console_vars() -> dict[str, Any]:
         "wm_base_before_score": "",
         "wm_extracted_score": "",
         "wm_test_score": "",
+        "wm_calc_teacher_score": "",
+        "wm_calc_student_score": "",
+        "wm_calc_origin_score": "",
         "watermark_input_json": "",
         "watermark_model_name": "qwen2-vl",
         "watermark_python_bin": "",
@@ -1393,9 +1397,18 @@ class WebConsole:
             cwd = str(self.console_vars.get("vla_mark_dir", "")).strip()
         return _path_join(cwd, "outputs", "watermark_detect_vqlord.json")
 
+    def watermark_calculator_payload(self) -> dict[str, Any]:
+        with self.lock:
+            return calculate_watermark_fading_risk(
+                self.console_vars.get("wm_calc_teacher_score"),
+                self.console_vars.get("wm_calc_student_score"),
+                self.console_vars.get("wm_calc_origin_score"),
+            )
+
     def watermark_payload(self) -> dict[str, Any]:
         with self.lock:
             input_json = str(self.console_vars.get("watermark_input_json", "")).strip()
+        calculator = self.watermark_calculator_payload()
         output_path = self.watermark_output_path()
         if self.debug:
             done = "watermark_detect" in self.sim_sync_completed()
@@ -1411,6 +1424,7 @@ class WebConsole:
             "num_scored": report.get("num_scored") if isinstance(report, dict) else None,
             "num_total": report.get("num_total_records") if isinstance(report, dict) else None,
             "split": report.get("split") if isinstance(report, dict) else None,
+            "calculator": calculator,
             "metrics": {
                 "mean_z": fmt_metric(safe_float(metrics.get("mean_z"))),
                 "median_z": fmt_metric(safe_float(metrics.get("median_z"))),
@@ -1681,6 +1695,12 @@ def create_app(debug: bool = False) -> FastAPI:
     @app.get("/api/watermark")
     def watermark() -> dict[str, Any]:
         return console.watermark_payload()
+
+    @app.post("/api/watermark/calculate")
+    def calculate_watermark(payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+        config = console.update_config(payload)
+        calculator = console.watermark_calculator_payload()
+        return {"ok": calculator.get("status") == "ok", "calculator": calculator, "config": config.get("config")}
 
     @app.get("/api/history")
     def history_list() -> dict[str, Any]:
@@ -2110,6 +2130,19 @@ INDEX_HTML = r"""
     .wm-gauge::after { content: ""; position: absolute; left: 50%; bottom: 0; width: 2px; height: 11px; transform: translateX(-50%); border-radius: 2px; background: var(--warn); opacity: .85; }
     .wm-gauge span { position: relative; z-index: 1; font-family: var(--mono); font-size: 12px; color: var(--muted); }
     .wm-metrics { grid-template-columns: repeat(4, minmax(0,1fr)); }
+    .wm-calculator { position: relative; overflow: hidden; }
+    .wm-calculator::after { content: ""; position: absolute; right: -70px; bottom: -90px; width: 220px; height: 220px; border-radius: 50%; background: radial-gradient(circle, rgba(59,130,246,.1), transparent 70%); pointer-events: none; }
+    .wm-calc-grid { position: relative; z-index: 1; display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 13px; }
+    .wm-calc-label { display: flex; align-items: center; gap: 7px; }
+    .wm-calc-symbol { width: 21px; height: 21px; display: inline-grid; place-items: center; border-radius: 6px; background: var(--accent-soft); color: var(--accent-2); font-family: var(--mono); font-size: 11px; font-weight: 800; }
+    .wm-calc-actions { position: relative; z-index: 1; display: flex; align-items: center; gap: 12px; margin-top: 3px; }
+    .wm-calc-hint { min-height: 18px; color: var(--muted); font-family: var(--mono); font-size: 11px; }
+    .wm-calc-hint.error { color: var(--bad); }
+    .wm-risk-hero { margin-top: 15px; border-color: rgba(59,130,246,.24); background: linear-gradient(135deg, rgba(239,246,255,.98), rgba(255,255,255,.94)); }
+    .wm-risk-gauge::after { display: none; }
+    .wm-risk-formula { max-width: min(760px, 72vw); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .watermark-divider { display: flex; align-items: center; gap: 12px; margin: 22px 0 14px; color: var(--muted); font-size: 11px; font-weight: 700; letter-spacing: .3px; }
+    .watermark-divider::before, .watermark-divider::after { content: ""; height: 1px; flex: 1; background: var(--line); }
     @property --deg { syntax: "<angle>"; inherits: false; initial-value: 0deg; }
 
     .tabs { display: flex; gap: 6px; border-bottom: 1px solid var(--line); margin-bottom: 18px; overflow: auto; padding-bottom: 0; }
@@ -2378,7 +2411,7 @@ INDEX_HTML = r"""
       .actions { grid-template-columns:1fr; }
       .actions .brand { grid-column:auto !important; }
       .runline { grid-template-columns:1fr; }
-      .metrics, .risk-summary, .grid2, .grid3 { grid-template-columns:1fr; }
+      .metrics, .risk-summary, .grid2, .grid3, .wm-calc-grid { grid-template-columns:1fr; }
       .reuse-head { align-items:flex-start; }
       .reuse-check { white-space:normal; justify-content:flex-end; text-align:right; }
       .pane { width:100%; max-width:100%; overflow-x:auto; }
@@ -2506,7 +2539,7 @@ INDEX_HTML = r"""
       </section>
       <section id="watermarkPane" class="pane">
         <div class="panel">
-          <p class="panel-title">水印失效风险检测 · z-mean</p>
+          <p class="panel-title">VLA-Mark 水印失效风险检测 · z-mean</p>
           <div class="grid2">
             <div class="field"><label>学生四字段回答 JSON 路径</label><input data-console="watermark_input_json" placeholder="/path/to/stage3_..._parallel.json"></div>
             <div class="field"><label>抽样条数（0 = 按 20% 抽样）</label><input data-console="watermark_sample_size" placeholder="0"></div>
@@ -2531,6 +2564,27 @@ INDEX_HTML = r"""
           <div class="metric"><span>水印检出率 (z&gt;4)</span><strong id="wmRate">-</strong></div>
         </div>
         <div class="grid3" id="watermarkFields"></div>
+        <div class="watermark-divider"><span>通用水印风险计算器</span></div>
+        <div class="panel wm-calculator" id="watermarkCalculator">
+          <p class="panel-title">通用水印失效风险计算</p>
+          <div class="wm-calc-grid">
+            <div class="field"><label class="wm-calc-label"><span class="wm-calc-symbol">T</span>水印教师得分</label><input type="number" step="any" inputmode="decimal" data-console="wm_calc_teacher_score"></div>
+            <div class="field"><label class="wm-calc-label"><span class="wm-calc-symbol">S</span>学习水印后的学生得分</label><input type="number" step="any" inputmode="decimal" data-console="wm_calc_student_score"></div>
+            <div class="field"><label class="wm-calc-label"><span class="wm-calc-symbol">O</span>原始学生得分</label><input type="number" step="any" inputmode="decimal" data-console="wm_calc_origin_score"></div>
+          </div>
+          <div class="wm-calc-actions">
+            <button class="btn primary" id="wmCalculateBtn" type="button">计算风险</button>
+            <span class="wm-calc-hint" id="wmCalcHint">等待输入</span>
+          </div>
+        </div>
+        <div class="wm-hero panel wm-risk-hero">
+          <div class="wm-hero-main">
+            <span class="wm-cap">量化水印失效风险</span>
+            <strong id="wmCalcRisk">-</strong>
+            <span class="wm-sub wm-risk-formula" id="wmCalcFormula">(T - S) / (T - O) × 100%</span>
+          </div>
+          <div class="wm-gauge wm-risk-gauge" id="wmCalcGauge"><span>Risk</span></div>
+        </div>
       </section>
       <section id="dataPane" class="pane">
         <div class="panel">
@@ -3650,6 +3704,7 @@ INDEX_HTML = r"""
       renderWatermark(data);
     }
     function renderWatermark(data) {
+      renderWatermarkCalculator(data.calculator || {});
       const m = data.metrics || {};
       const meanEl = $("#wmMeanZ");
       if (meanEl) {
@@ -3683,6 +3738,48 @@ INDEX_HTML = r"""
       // results are in -> stop the 3s catch-up poll started by the detect button
       if (data.ok && window.__wmPoll) { clearInterval(window.__wmPoll); window.__wmPoll = null; }
     }
+    function renderWatermarkCalculator(result) {
+      const riskEl = $("#wmCalcRisk");
+      const formulaEl = $("#wmCalcFormula");
+      const hintEl = $("#wmCalcHint");
+      const gauge = $("#wmCalcGauge");
+      if (!riskEl || !formulaEl || !hintEl || !gauge) return;
+      const reset = (hint, error = false) => {
+        riskEl.textContent = "-";
+        formulaEl.textContent = "(T - S) / (T - O) × 100%";
+        hintEl.textContent = hint;
+        hintEl.classList.toggle("error", error);
+        gauge.style.setProperty("--deg", "0deg");
+        gauge.style.background = "conic-gradient(var(--accent-3), var(--accent-2) var(--deg,0deg), var(--surface-3) 0deg)";
+        gauge.querySelector("span").textContent = "Risk";
+      };
+      if (result.status === "invalid_baseline") {
+        reset("教师得分与原始学生得分相同，无法计算", true);
+        return;
+      }
+      if (result.status !== "ok") {
+        reset("等待输入");
+        return;
+      }
+      const score = Number(result.risk_score);
+      const percent = Number(result.risk_percent);
+      const rawPercent = Number(result.raw_percent);
+      const values = result.inputs || {};
+      const formatScore = value => Number.isFinite(Number(value)) ? Number(value).toLocaleString(undefined, { maximumFractionDigits: 6 }) : "-";
+      riskEl.textContent = `${percent.toFixed(2)}%`;
+      riskEl.classList.remove("flash");
+      void riskEl.offsetWidth;
+      riskEl.classList.add("flash");
+      formulaEl.textContent = `(${formatScore(values.teacher)} - ${formatScore(values.student)}) / (${formatScore(values.teacher)} - ${formatScore(values.origin)}) × 100%`;
+      const levels = { low: "低风险", medium: "中风险", high: "高风险", critical: "严重风险" };
+      hintEl.textContent = result.clamped ? `原始结果 ${rawPercent.toFixed(2)}%，已量化到 0–100%` : levels[result.risk_level] || "已计算";
+      hintEl.classList.remove("error");
+      const deg = Math.max(0, Math.min(360, score * 360));
+      const color = score >= .75 ? "#dc2626" : score >= .5 ? "#f97316" : score >= .25 ? "#eab308" : "#22c55e";
+      gauge.style.setProperty("--deg", `${deg.toFixed(1)}deg`);
+      gauge.style.background = `conic-gradient(${color}, var(--accent-2) var(--deg,0deg), var(--surface-3) 0deg)`;
+      gauge.querySelector("span").textContent = levels[result.risk_level] || "Risk";
+    }
     function startPolling() {
       if (pollTimer) clearInterval(pollTimer);
       if (historyId) return;                 // frozen while viewing an archive
@@ -3715,7 +3812,7 @@ INDEX_HTML = r"""
     // Running a task while an archive is on screen would execute against live config,
     // not the archived params -> lock the action buttons until we exit history mode.
     function setActionsLocked(locked) {
-      $$("[data-task], #runPipelineBtn, #cloneBtn, #loadRemoteBtn, #saveRemoteBtn").forEach(b => { b.disabled = locked; });
+      $$("[data-task], #runPipelineBtn, #cloneBtn, #loadRemoteBtn, #saveRemoteBtn, #wmCalculateBtn").forEach(b => { b.disabled = locked; });
     }
     async function enterHistory(id) {
       const rec = await (await fetch(`/api/history/${encodeURIComponent(id)}`)).json();
@@ -3814,6 +3911,25 @@ INDEX_HTML = r"""
         startPolling();
       });
       $$("#refreshStatusBtn, #refreshDashboardBtn, #refreshRiskBtn").forEach(btn => btn.addEventListener("click", () => { refreshStatus(); refreshDashboard(); }));
+      const wmCalculateBtn = $("#wmCalculateBtn");
+      if (wmCalculateBtn) {
+        wmCalculateBtn.addEventListener("click", async () => {
+          if (historyId) return;
+          wmCalculateBtn.disabled = true;
+          try {
+            const data = await post("/api/watermark/calculate");
+            if (data.config) state = data.config;
+            renderWatermarkCalculator(data.calculator || {});
+          } finally {
+            wmCalculateBtn.disabled = false;
+          }
+        });
+        $$("#watermarkCalculator [data-console]").forEach(input => input.addEventListener("input", () => {
+          if (historyId) return;
+          renderWatermarkCalculator({});
+          $("#wmCalcHint").textContent = "数据已修改，等待计算";
+        }));
+      }
       const wmBtn = $("#refreshWatermarkBtn");
       if (wmBtn) wmBtn.addEventListener("click", refreshWatermark);
       const logScroller = $(".logbox");

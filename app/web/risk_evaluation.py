@@ -286,3 +286,27 @@ def calculate_watermark_erosion(victim: object, extracted: object, clean: object
         "source": source,
         "scores": {"victim": victim_score, "extracted": extracted_score, "clean": clean_score},
     }
+
+
+def calculate_watermark_fading_risk(teacher: object, student: object, origin: object) -> dict[str, Any]:
+    teacher_score = as_float(teacher)
+    student_score = as_float(student)
+    origin_score = as_float(origin)
+    inputs = {"teacher": teacher_score, "student": student_score, "origin": origin_score}
+    if any(value is None for value in inputs.values()):
+        return {"status": "missing", "risk_score": None, "risk_level": "not_measured", "inputs": inputs}
+    denominator = teacher_score - origin_score
+    if abs(denominator) <= EPSILON:
+        return {"status": "invalid_baseline", "risk_score": None, "risk_level": "not_measured", "inputs": inputs}
+    raw_ratio = (teacher_score - student_score) / denominator
+    risk_score = clip01(raw_ratio)
+    return {
+        "status": "ok",
+        "risk_score": risk_score,
+        "risk_percent": risk_score * 100.0,
+        "raw_ratio": raw_ratio,
+        "raw_percent": raw_ratio * 100.0,
+        "clamped": not math.isclose(raw_ratio, risk_score, rel_tol=0.0, abs_tol=EPSILON),
+        "risk_level": _risk_level(risk_score, ((0.75, "critical"), (0.50, "high"), (0.25, "medium"))),
+        "inputs": inputs,
+    }
