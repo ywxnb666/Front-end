@@ -2205,7 +2205,7 @@ INDEX_HTML = r"""
 
     .logbox {
       position: relative;
-      height: 440px; overflow: auto; white-space: pre-wrap;
+      height: 440px; overflow: auto;
       background:
         repeating-linear-gradient(0deg, rgba(148,197,255,.03) 0 1px, transparent 1px 3px),
         linear-gradient(180deg, rgba(37,99,235,.05), transparent 90px),
@@ -2217,6 +2217,7 @@ INDEX_HTML = r"""
     .logbox::-webkit-scrollbar-thumb { background: #2c4f80; }
     /* semantic log-line tinting (classes assigned in renderPipeline) */
     .log-line { display: block; }
+    #logBox { white-space: pre-wrap; }
     .log-line:empty::before { content: "\00a0"; }
     .log-line.log-err { color: #ff9285; }
     .log-line.log-warn { color: #ffd479; }
