@@ -57,7 +57,6 @@ PARAMETER_ALIASES: dict[str, tuple[str, str | tuple[str, ...], str]] = {
     "assistant_api_base": ("console_vars", "assistant_api_base", "text"),
     "assistant_model": ("console_vars", "assistant_model", "text"),
     "assistant_context_limit": ("console_vars", "assistant_context_limit", "int"),
-    "assistant_reasoning": ("console_vars", "assistant_reasoning", "bool"),
     "watermark_model_name": ("console_vars", "watermark_model_name", "text"),
     "watermark_torch_dtype": ("console_vars", "watermark_torch_dtype", "text"),
     "watermark_device": ("console_vars", "watermark_device", "text"),

@@ -14,6 +14,7 @@ from typing import Any
 
 from app.config import APP_DIR
 from app.web.agent_schemas import ActionProposal, AgentChatRequest, AgentChatResponse
+from app.web.assistant_knowledge import APPLICATION_KNOWLEDGE
 from app.web.agent_tools import (
     AgentToolContext,
     apply_preset as tool_apply_preset,
@@ -53,7 +54,7 @@ AGENT_SYSTEM_PROMPT = """你是 MLLM 能力泄漏风险检测平台的轻量执�
 6. 日志只读取解决问题所需的最近部分，避免重复读取。
 7. 回答使用简洁中文，区分建议、已修改、等待确认、正在运行和执行完成。
 
-参数白名单别名：样本数量、MAX_NEW_TOKENS、NUM_WORKERS、MAX_CONCURRENCY、教师语言/思考开关、控制集、Stage1/Stage2 学习率、LoRA、损失权重、评估周期、judge 数据集与 split、并行控制，以及 train_num、max_samples、control_max_samples、eval_max_samples、judge_sample_num、stage1_epochs、stage1_batch_size、stage1_grad_accum、stage1_max_length、stage2_epochs、period_num、stage2_batch_size、stage2_grad_accum、stage2_max_length、eval_max_new_tokens、use_4bit、freeze_vision_tower、stage2_wrong_image_enable、stage2_pair_use_answer_correctness、dataset_name、cuda_devices、teacher_api_base、victim_model、judge_model、judge_api_base、judge_eval_api_base、watermark 参数。
+参数白名单别名：样本数量、MAX_NEW_TOKENS、NUM_WORKERS、MAX_CONCURRENCY、教师语言/教师思考开关、控制集、Stage1/Stage2 学习率、LoRA、损失权重、评估周期、judge 数据集与 split、并行控制，以及 train_num、max_samples、control_max_samples、eval_max_samples、judge_sample_num、stage1_epochs、stage1_batch_size、stage1_grad_accum、stage1_max_length、stage2_epochs、period_num、stage2_batch_size、stage2_grad_accum、stage2_max_length、eval_max_new_tokens、use_4bit、freeze_vision_tower、stage2_wrong_image_enable、stage2_pair_use_answer_correctness、dataset_name、cuda_devices、teacher_api_base、victim_model、judge_model、judge_api_base、judge_eval_api_base、watermark 参数。
 教师标注数量通常同时修改 train_num 和 max_samples；思维链评估抽样使用 judge_sample_num。Stage2 batch size 会同时作用于 Phase A 和 Phase B。
 可用参数预设：demo、recommended、low_memory、演示推荐参数（也接受 demo_recommended）。演示推荐参数是当前前端的小样本展示配置。
 
@@ -61,6 +62,11 @@ Pipeline 阶段 ID：teacher_collect、teacher_eval、origin_eval、stage1_train
 """
 
 ASK_SYSTEM_PROMPT = """你是 MLLM 能力泄漏风险检测平台的内置助手。只回答本平台的功能、参数、运行流程、报错、风险评估和水印检测问题。不要假装运行了工具或访问了服务器；无关问题简短说明能力范围。使用简洁准确的中文回答。"""
+
+# Both modes use the same product facts. Agent additionally receives tools and
+# runtime state; Ask remains read-only and must not infer that it ran a tool.
+AGENT_SYSTEM_PROMPT += "\n\n" + APPLICATION_KNOWLEDGE
+ASK_SYSTEM_PROMPT += "\n\n" + APPLICATION_KNOWLEDGE
 
 
 def _estimate_tokens(text: str) -> int:
@@ -86,13 +92,12 @@ def _safe_session_id(value: str) -> str:
     return text if SESSION_ID_RE.fullmatch(text) else uuid.uuid4().hex
 
 
-def _enabled(value: Any, default: bool = True) -> bool:
-    text = str(value).strip().lower()
-    if text in {"1", "true", "yes", "on"}:
-        return True
-    if text in {"0", "false", "no", "off"}:
-        return False
-    return default
+def _dpsk_reasoning_body(enabled: bool) -> dict[str, Any]:
+    """Build dpsk-v4-flash's OpenAI-compatible thinking parameters."""
+    body: dict[str, Any] = {"thinking": {"type": "enabled" if enabled else "disabled"}}
+    if enabled:
+        body["reasoning_effort"] = "high"
+    return body
 
 
 class AgentSessionStore:
@@ -381,7 +386,8 @@ class AgentService:
                 return self._run_legacy_ask(user_message, history, session_id, history_view)
             raise RuntimeError("缺少 pydantic-ai 依赖，请安装 requirements.txt") from exc
 
-        base_url, api_key, model_name, reasoning_enabled = self._assistant_connection()
+        base_url, api_key, model_name = self._assistant_connection()
+        reasoning_enabled = mode == "agent"
 
         model_class = getattr(openai_models, "OpenAIChatModel", None) or getattr(openai_models, "OpenAIModel", None)
         if model_class is None:
@@ -400,12 +406,10 @@ class AgentService:
         settings: dict[str, Any] = {
             "temperature": 0.2,
             "max_tokens": 1600,
+            # dpsk-v4-flash uses thinking.type for the switch and the
+            # top-level reasoning_effort field for strength.
+            "extra_body": _dpsk_reasoning_body(reasoning_enabled),
         }
-        if reasoning_enabled:
-            # PydanticAI forwards the standard setting where supported; the
-            # extra body covers dpsk-compatible gateways using this switch.
-            settings["openai_reasoning_effort"] = "high"
-            settings["extra_body"] = {"reasoning": {"enabled": True}}
         async def stream_handler(_run_context: Any, stream: Any) -> None:
             async for event in stream:
                 streamed = self._stream_event_payload(event)
@@ -436,7 +440,7 @@ class AgentService:
 
     def _run_legacy_ask(self, user_message: str, history: str, session_id: str, history_view: bool = False) -> AgentChatResponse:
         """Keep Ask mode usable while an environment is installing PydanticAI."""
-        base_url, api_key, model, reasoning_enabled = self._assistant_connection()
+        base_url, api_key, model = self._assistant_connection()
         prompt = self._build_prompt(user_message, history, history_view)
         request_payload = {
             "model": model,
@@ -444,8 +448,7 @@ class AgentService:
             "temperature": 0.2,
             "max_tokens": 1600,
         }
-        if reasoning_enabled:
-            request_payload["reasoning"] = {"enabled": True}
+        request_payload.update(_dpsk_reasoning_body(False))
         request = urllib.request.Request(
             base_url + "/chat/completions",
             data=json.dumps(request_payload, ensure_ascii=False).encode("utf-8"),
@@ -472,14 +475,28 @@ class AgentService:
         return AgentChatResponse(ok=True, mode="ask", session_id=session_id, message=content or "模型没有返回文本内容", reasoning=reasoning)
 
     def _safe_context_text(self) -> str:
-        return json.dumps(safe_app_state_snapshot(self.console), ensure_ascii=False)
+        snapshot = safe_app_state_snapshot(self.console)
+        history = self.console.history_list()
+        snapshot["history_archive"] = {
+            "count": len(history),
+            "local_directory": str(APP_DIR / "history"),
+            "recent_items": [
+                {
+                    "id": item.get("id", ""),
+                    "label": item.get("label", ""),
+                    "created_at": item.get("created_at", ""),
+                    "risk": item.get("risk", "-"),
+                }
+                for item in history[:20]
+            ],
+        }
+        return json.dumps(snapshot, ensure_ascii=False)
 
-    def _assistant_connection(self) -> tuple[str, str, str, bool]:
+    def _assistant_connection(self) -> tuple[str, str, str]:
         with self.console.lock:
             base_url = str(self.console.console_vars.get("assistant_api_base", "")).strip().rstrip("/")
             api_key = str(self.console.console_vars.get("assistant_api_key", "")).strip()
             model = str(self.console.console_vars.get("assistant_model", "dpsk-v4-flash")).strip() or "dpsk-v4-flash"
-            reasoning_enabled = _enabled(self.console.console_vars.get("assistant_reasoning", True))
         if not base_url:
             raise ValueError("尚未配置 AI 助手 Base URL")
         if not api_key:
@@ -487,13 +504,13 @@ class AgentService:
         for suffix in ("/chat/completions", "/responses"):
             if base_url.lower().endswith(suffix):
                 base_url = base_url[: -len(suffix)].rstrip("/")
-        return base_url, api_key, model, reasoning_enabled
+        return base_url, api_key, model
 
     def _build_prompt(self, user_message: str, history: str, history_view: bool = False) -> str:
         context = self._safe_context_text()
         if history_view:
             context += "\n当前界面正在查看历史归档：只允许读取，不得修改参数、归档、同步配置或运行 Pipeline。"
-        sections = [f"当前平台配置摘要：\n{context}"]
+        sections = [f"当前平台状态摘要（已脱敏）：\n{context}"]
         if history:
             sections.append(f"以下是当前会话上下文，仅用于保持连续性：\n{history}")
         sections.append(f"用户最新请求：\n{user_message}")

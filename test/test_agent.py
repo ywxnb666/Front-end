@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app.config import AppConfig
-from app.web.agent_service import AgentService, AgentSessionStore
+from app.web.agent_service import AGENT_SYSTEM_PROMPT, ASK_SYSTEM_PROMPT, AgentService, AgentSessionStore
 from app.web.agent_schemas import AgentChatResponse
 from app.web.agent_tools import (
     AgentToolContext,
@@ -37,6 +37,26 @@ class AgentTests(unittest.TestCase):
                 "testsession", action_type, title, detail, payload
             ),
         )
+
+    def test_product_knowledge_is_shared_by_ask_and_agent(self) -> None:
+        for prompt in (ASK_SYSTEM_PROMPT, AGENT_SYSTEM_PROMPT):
+            self.assertIn('左侧栏的“历史测评数据”区域', prompt)
+            self.assertIn("~/.remote-clone-tool/history/", prompt)
+            self.assertIn("不要建议用户在笔记本上直接打开服务器路径", prompt)
+
+    def test_prompt_context_includes_local_history_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            console = self.make_console(Path(temp_dir))
+            console.history_list = lambda: [{
+                "id": "archive-1",
+                "label": "ScienceQA 完整评估",
+                "created_at": "2026-08-18 12:00:00",
+                "risk": "0.6386",
+            }]
+            context = json.loads(console.agent_service._safe_context_text())
+            self.assertEqual(context["history_archive"]["count"], 1)
+            self.assertEqual(context["history_archive"]["recent_items"][0]["id"], "archive-1")
+            self.assertNotIn("assistant_api_key", context["console_vars"])
 
     def test_parameter_patch_is_allowlisted_and_saved(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -73,7 +93,6 @@ class AgentTests(unittest.TestCase):
                 "assistant_api_base": "https://assistant.example/v1",
                 "assistant_model": "custom-assistant",
                 "assistant_context_limit": 65536,
-                "assistant_reasoning": False,
                 "cuda_devices": "2",
                 "watermark_device": "cpu",
                 "watermark_torch_dtype": "float32",
@@ -293,7 +312,8 @@ class AgentTests(unittest.TestCase):
             def run_sync(self, prompt, deps, model_settings, event_stream_handler=None):
                 self.settings = model_settings
                 context = types.SimpleNamespace(deps=deps)
-                self.tools["set_allowed_parameters"](context, {"train_num": 7})
+                if "set_allowed_parameters" in self.tools:
+                    self.tools["set_allowed_parameters"](context, {"train_num": 7})
                 return FakeResult()
 
         class FakeProvider:
@@ -329,7 +349,6 @@ class AgentTests(unittest.TestCase):
                 "assistant_api_base": "https://example.invalid/v1/chat/completions",
                 "assistant_api_key": "secret",
                 "assistant_model": "dpsk-v4-flash",
-                "assistant_reasoning": "1",
             })
             result = console.agent_service._run_pydantic_agent("agent", "采样改为 7", "", "session1234")
             self.assertTrue(result.ok)
@@ -338,7 +357,18 @@ class AgentTests(unittest.TestCase):
             self.assertEqual(console.form_vars["TRAIN_NUM"], "7")
             self.assertIsNotNone(result.config)
             self.assertEqual(FakeAgent.last.model.provider.base_url, "https://example.invalid/v1")
-            self.assertEqual(FakeAgent.last.settings["extra_body"], {"reasoning": {"enabled": True}})
+            self.assertEqual(FakeAgent.last.settings["extra_body"], {
+                "thinking": {"type": "enabled"},
+                "reasoning_effort": "high",
+            })
+            console.console_vars["assistant_reasoning"] = "0"  # Legacy value must be ignored.
+            console.agent_service._run_pydantic_agent("agent", "采样改为 7", "", "session1234")
+            self.assertEqual(FakeAgent.last.settings["extra_body"], {
+                "thinking": {"type": "enabled"},
+                "reasoning_effort": "high",
+            })
+            console.agent_service._run_pydantic_agent("ask", "如何查看历史归档", "", "session1234")
+            self.assertEqual(FakeAgent.last.settings["extra_body"], {"thinking": {"type": "disabled"}})
 
     def test_chat_stream_orders_reasoning_before_answer_and_persists(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -340,7 +340,6 @@ def default_console_vars() -> dict[str, Any]:
         "assistant_api_key": os.environ.get("ASSISTANT_API_KEY", ""),
         "assistant_model": os.environ.get("ASSISTANT_MODEL", "dpsk-v4-flash"),
         "assistant_context_limit": 131072,
-        "assistant_reasoning": True,
         "wm_base_before_score": "",
         "wm_extracted_score": "",
         "wm_test_score": "",
@@ -1974,6 +1973,55 @@ INDEX_HTML = r"""
       background-image: linear-gradient(45deg, transparent 50%, var(--muted) 50%), linear-gradient(135deg, var(--muted) 50%, transparent 50%);
       background-position: calc(100% - 16px) 17px, calc(100% - 11px) 17px;
       background-size: 5px 5px, 5px 5px; background-repeat: no-repeat; }
+    .history-select { position: relative; }
+    .history-select-trigger {
+      width: 100%; min-height: 42px; padding: 9px 38px 9px 12px;
+      display: flex; align-items: center; text-align: left;
+      border: 1px solid var(--line); border-radius: 10px;
+      background: linear-gradient(180deg, #fff, #f8fbff); color: var(--text);
+      font-family: var(--font); font-size: 12.5px; font-weight: 650;
+      box-shadow: 0 1px 2px rgba(23,54,110,.04); cursor: pointer;
+      transition: border-color .18s ease, box-shadow .18s ease, background .18s ease;
+    }
+    .history-select-trigger:hover { border-color: var(--line-2); background: #fff; }
+    .history-select-trigger:focus-visible, .history-select.open .history-select-trigger { outline: none; border-color: var(--accent); background: #fff; box-shadow: var(--ring); }
+    .history-select-value { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .history-select-chevron {
+      position: absolute; right: 13px; top: 50%; width: 9px; height: 9px;
+      border-right: 1.8px solid var(--muted); border-bottom: 1.8px solid var(--muted);
+      transform: translateY(-68%) rotate(45deg); pointer-events: none;
+      transition: transform .22s cubic-bezier(.22,.8,.28,1), border-color .18s ease;
+    }
+    .history-select.open .history-select-chevron { border-color: var(--accent-2); transform: translateY(-28%) rotate(225deg); }
+    .history-menu {
+      position: fixed; z-index: 1180; margin: 0; padding: 6px;
+      overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain;
+      border: 1px solid rgba(148,177,218,.62); border-radius: 11px;
+      background: rgba(255,255,255,.985); box-shadow: 0 16px 36px rgba(23,54,110,.2), 0 2px 8px rgba(23,54,110,.08);
+      backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+      opacity: 0; visibility: hidden; pointer-events: none;
+      transform: translateY(-5px) scale(.985); transform-origin: top center;
+      transition: opacity .16s ease, transform .2s cubic-bezier(.22,.8,.28,1), visibility 0s .2s;
+    }
+    .history-menu.open { opacity: 1; visibility: visible; pointer-events: auto; transform: translateY(0) scale(1); transition-delay: 0s; }
+    .history-menu.open-up { transform-origin: bottom center; }
+    .history-option {
+      position: relative; width: 100%; min-height: 38px; padding: 9px 34px 9px 10px;
+      display: flex; align-items: center; border: 0; border-radius: 7px;
+      background: transparent; color: var(--text); text-align: left;
+      font-family: var(--font); font-size: 12px; font-weight: 570; line-height: 1.35;
+      cursor: pointer; transition: color .14s ease, background .14s ease;
+    }
+    .history-option:hover, .history-option.active { color: var(--accent-2); background: var(--accent-soft); }
+    .history-option.selected { color: var(--accent-2); font-weight: 700; background: rgba(219,234,254,.68); }
+    .history-option.selected::after {
+      content: ""; position: absolute; right: 13px; top: 50%; width: 10px; height: 5px;
+      border-left: 2px solid var(--accent-2); border-bottom: 2px solid var(--accent-2);
+      transform: translateY(-65%) rotate(-45deg);
+    }
+    .history-option-label { min-width: 0; overflow-wrap: anywhere; }
+    .history-menu::-webkit-scrollbar { width: 8px; }
+    .history-menu::-webkit-scrollbar-thumb { border: 2px solid transparent; border-radius: 12px; background: var(--line-2); background-clip: padding-box; }
     .hist-hint { margin: 9px 0 0; color: var(--dim); font-size: 10.5px; line-height: 1.5; }
 
     /* viewing an archived run: amber accents so it can't be mistaken for live data */
@@ -2449,7 +2497,12 @@ INDEX_HTML = r"""
         <p class="section-title">历史测评数据</p>
         <div class="field">
           <label>选择归档记录</label>
-          <select id="historySelect"><option value="">当前数据（实时）</option></select>
+          <div class="history-select" id="historySelect">
+            <button class="history-select-trigger" id="historySelectTrigger" type="button" role="combobox" aria-haspopup="listbox" aria-expanded="false" aria-controls="historySelectMenu">
+              <span class="history-select-value" id="historySelectValue">当前数据（实时）</span>
+            </button>
+            <span class="history-select-chevron" aria-hidden="true"></span>
+          </div>
         </div>
         <div class="btnrow" style="grid-template-columns:1fr 1fr;">
           <button class="btn" type="button" id="historyBackBtn">返回默认数据</button>
@@ -2676,7 +2729,6 @@ INDEX_HTML = r"""
         <div class="field"><label>Base URL</label><input data-console="assistant_api_base" placeholder="https://api.openai.com/v1"></div>
         <div class="field"><label>模型</label><input data-console="assistant_model" placeholder="dpsk-v4-flash"></div>
         <div class="field"><label>API Key</label><input type="password" data-console="assistant_api_key" placeholder="sk-..."></div>
-        <label class="reuse-check"><input class="reuse-toggle" type="checkbox" data-console="assistant_reasoning">启用思考</label>
       </div>
       <div class="assistant-messages" id="assistantMessages"><div class="assistant-msg assistant">你好，我可以解答平台问题，也可以在 Agent 模式下调整参数并规划实验。</div></div>
       <form class="assistant-compose" id="assistantForm">
@@ -2704,6 +2756,9 @@ INDEX_HTML = r"""
     let historyId = null;          // non-null => viewing an archived run
     let historyItems = [];
     let historyDir = "";
+    let historySelection = "";
+    let historyMenu = null;
+    let historyMenuActiveIndex = 0;
     let suppressSave = false;      // true while programmatically filling inputs
     const ASSISTANT_SESSION_KEY = "mllm-console-assistant-session";
     const ASSISTANT_MODE_KEY = "mllm-console-assistant-mode";
@@ -3794,12 +3849,88 @@ INDEX_HTML = r"""
       const risk = (it.risk && it.risk !== "-") ? ` · risk ${it.risk}` : "";
       return `${it.label}${risk}`;
     }
+    function historyOptions() {
+      return [{ id: "", label: "当前数据（实时）" }, ...historyItems.map(it => ({ id: it.id, label: historyOptionLabel(it) }))];
+    }
+    function setHistorySelection(id) {
+      const options = historyOptions();
+      const selected = options.find(option => option.id === id) || options[0];
+      historySelection = selected.id;
+      const value = $("#historySelectValue");
+      if (value) value.textContent = selected.label;
+      const trigger = $("#historySelectTrigger");
+      if (trigger) trigger.title = selected.label;
+      if (historyMenu) {
+        Array.from(historyMenu.querySelectorAll(".history-option")).forEach((option, index) => {
+          const isSelected = option.dataset.id === historySelection;
+          option.classList.toggle("selected", isSelected);
+          option.setAttribute("aria-selected", String(isSelected));
+          if (isSelected) historyMenuActiveIndex = index;
+        });
+      }
+    }
+    function renderHistoryMenu() {
+      if (!historyMenu) return;
+      historyMenu.innerHTML = historyOptions().map(option =>
+        `<button class="history-option" type="button" role="option" data-id="${escapeHtml(option.id)}" aria-selected="${option.id === historySelection}"><span class="history-option-label">${escapeHtml(option.label)}</span></button>`
+      ).join("");
+      setHistorySelection(historySelection);
+    }
+    function positionHistoryMenu() {
+      if (!historyMenu?.classList.contains("open")) return;
+      const trigger = $("#historySelectTrigger");
+      if (!trigger) return;
+      const rect = trigger.getBoundingClientRect();
+      const gap = 6;
+      const viewportGap = 10;
+      const spaceBelow = window.innerHeight - rect.bottom - viewportGap;
+      const spaceAbove = rect.top - viewportGap;
+      const desiredHeight = Math.min(304, historyMenu.scrollHeight);
+      const openUp = spaceBelow < Math.min(180, desiredHeight) && spaceAbove > spaceBelow;
+      const available = Math.max(96, (openUp ? spaceAbove : spaceBelow) - gap);
+      const menuHeight = Math.min(desiredHeight, available);
+      const left = Math.min(Math.max(viewportGap, rect.left), Math.max(viewportGap, window.innerWidth - rect.width - viewportGap));
+      historyMenu.style.left = `${Math.round(left)}px`;
+      historyMenu.style.width = `${Math.round(rect.width)}px`;
+      historyMenu.style.maxHeight = `${Math.floor(menuHeight)}px`;
+      historyMenu.style.top = `${Math.round(openUp ? rect.top - menuHeight - gap : rect.bottom + gap)}px`;
+      historyMenu.classList.toggle("open-up", openUp);
+    }
+    function closeHistoryMenu({ focus = false } = {}) {
+      if (!historyMenu) return;
+      historyMenu.classList.remove("open", "open-up");
+      $("#historySelect")?.classList.remove("open");
+      const trigger = $("#historySelectTrigger");
+      trigger?.setAttribute("aria-expanded", "false");
+      if (focus) trigger?.focus();
+    }
+    function setHistoryMenuActive(index, scroll = true) {
+      const options = historyMenu ? Array.from(historyMenu.querySelectorAll(".history-option")) : [];
+      if (!options.length) return;
+      historyMenuActiveIndex = (index + options.length) % options.length;
+      options.forEach((option, optionIndex) => option.classList.toggle("active", optionIndex === historyMenuActiveIndex));
+      if (scroll) options[historyMenuActiveIndex].scrollIntoView({ block: "nearest" });
+    }
+    function openHistoryMenu() {
+      if (!historyMenu) return;
+      renderHistoryMenu();
+      $("#historySelect")?.classList.add("open");
+      $("#historySelectTrigger")?.setAttribute("aria-expanded", "true");
+      historyMenu.classList.add("open");
+      positionHistoryMenu();
+      setHistoryMenuActive(historyMenuActiveIndex, false);
+      requestAnimationFrame(positionHistoryMenu);
+    }
+    async function chooseHistory(id) {
+      closeHistoryMenu({ focus: true });
+      setHistorySelection(id);
+      if (id) await enterHistory(id); else await exitHistory();
+    }
     function renderHistoryOptions(items, keep) {
       historyItems = items || [];
-      const sel = $("#historySelect");
-      sel.innerHTML = `<option value="">当前数据（实时）</option>` +
-        historyItems.map(it => `<option value="${it.id}">${escapeHtml(historyOptionLabel(it))}</option>`).join("");
-      sel.value = keep && historyItems.some(it => it.id === keep) ? keep : "";
+      const selected = keep && historyItems.some(it => it.id === keep) ? keep : "";
+      setHistorySelection(selected);
+      renderHistoryMenu();
     }
     async function loadHistoryList(keep) {
       try {
@@ -3816,8 +3947,9 @@ INDEX_HTML = r"""
     }
     async function enterHistory(id) {
       const rec = await (await fetch(`/api/history/${encodeURIComponent(id)}`)).json();
-      if (!rec.ok) { setHistoryHint(rec.message || "读取历史记录失败"); $("#historySelect").value = historyId || ""; return; }
+      if (!rec.ok) { setHistoryHint(rec.message || "读取历史记录失败"); setHistorySelection(historyId || ""); return; }
       historyId = id;
+      setHistorySelection(id);
       stopPolling();
       document.body.classList.add("history-view");
       setActionsLocked(true);
@@ -3839,7 +3971,7 @@ INDEX_HTML = r"""
       historyId = null;
       document.body.classList.remove("history-view");
       setActionsLocked(false);
-      $("#historySelect").value = "";
+      setHistorySelection("");
       suppressSave = true;
       applyConfig(await (await fetch("/api/config")).json());
       suppressSave = false;
@@ -3855,6 +3987,7 @@ INDEX_HTML = r"""
       let sidebarScrollTop = 0;
       try { sidebarScrollTop = Math.max(0, Number(localStorage.getItem(SIDEBAR_SCROLL_STORAGE_KEY)) || 0); } catch (error) { /* use top */ }
       const setSidebarCollapsed = (collapsed, initializing = false) => {
+        closeHistoryMenu();
         if (collapsed && !initializing) {
           sidebarScrollTop = sidebar.scrollTop;
           try { localStorage.setItem(SIDEBAR_SCROLL_STORAGE_KEY, String(sidebarScrollTop)); } catch (error) { /* storage may be disabled */ }
@@ -3947,10 +4080,38 @@ INDEX_HTML = r"""
         startPolling();
         if (btn.dataset.task === "watermark_detect") window.__wmPoll = setInterval(refreshWatermark, 3000);
       }));
-      $("#historySelect").addEventListener("change", (event) => {
-        const id = event.target.value;
-        if (id) enterHistory(id); else exitHistory();
+      historyMenu = document.createElement("div");
+      historyMenu.id = "historySelectMenu";
+      historyMenu.className = "history-menu";
+      historyMenu.setAttribute("role", "listbox");
+      historyMenu.setAttribute("aria-label", "历史测评数据");
+      document.body.appendChild(historyMenu);
+      $("#historySelectTrigger").addEventListener("click", () => {
+        if (historyMenu.classList.contains("open")) closeHistoryMenu(); else openHistoryMenu();
       });
+      historyMenu.addEventListener("click", event => {
+        const option = event.target.closest(".history-option");
+        if (option) chooseHistory(option.dataset.id || "");
+      });
+      $("#historySelectTrigger").addEventListener("keydown", event => {
+        if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+          event.preventDefault();
+          if (!historyMenu.classList.contains("open")) openHistoryMenu();
+          setHistoryMenuActive(historyMenuActiveIndex + (event.key === "ArrowDown" ? 1 : -1));
+        } else if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          if (!historyMenu.classList.contains("open")) openHistoryMenu();
+          else historyMenu.querySelector(".history-option.active")?.click();
+        } else if (event.key === "Escape") {
+          event.preventDefault();
+          closeHistoryMenu({ focus: true });
+        }
+      });
+      document.addEventListener("pointerdown", event => {
+        if (!event.target.closest("#historySelect") && !event.target.closest("#historySelectMenu")) closeHistoryMenu();
+      });
+      window.addEventListener("resize", positionHistoryMenu);
+      sidebar.addEventListener("scroll", positionHistoryMenu, { passive: true });
       $("#historyBackBtn").addEventListener("click", exitHistory);
       $("#historySaveBtn").addEventListener("click", async () => {
         if (historyId) { setHistoryHint("请先返回默认数据，再归档当前结果"); return; }
@@ -3962,8 +4123,7 @@ INDEX_HTML = r"""
         if (data.items) renderHistoryOptions(data.items, null); else await loadHistoryList(null);
       });
       $("#historyDeleteBtn").addEventListener("click", async () => {
-        const sel = $("#historySelect");
-        const id = sel.value || historyId;
+        const id = historySelection || historyId;
         if (!id) { setHistoryHint("请先在上方选择一条归档记录"); return; }
         const item = historyItems.find(it => it.id === id);
         if (!confirm(`删除归档记录「${item ? item.label : id}」？此操作不可撤销。`)) return;
