@@ -2709,10 +2709,10 @@ INDEX_HTML = r"""
         <path d="M27 3v4M25 5h4" stroke="white" stroke-width="1.7" stroke-linecap="round"/>
       </svg>
     </button>
-    <section class="assistant-panel" id="assistantPanel" aria-label="AI 助手">
+    <section class="assistant-panel" id="assistantPanel" aria-label="M豆">
       <div class="assistant-head">
         <span class="assistant-icon">AI</span>
-        <strong>平台 AI 助手</strong>
+        <strong>M豆</strong>
         <small id="assistantModelLabel">未配置</small>
         <button class="assistant-icon-btn" id="assistantClearBtn" type="button" title="清空当前会话">↺</button>
         <button class="assistant-icon-btn" id="assistantSettingsBtn" type="button" title="助手设置">⚙</button>
@@ -2730,7 +2730,7 @@ INDEX_HTML = r"""
         <div class="field"><label>模型</label><input data-console="assistant_model" placeholder="dpsk-v4-flash"></div>
         <div class="field"><label>API Key</label><input type="password" data-console="assistant_api_key" placeholder="sk-..."></div>
       </div>
-      <div class="assistant-messages" id="assistantMessages"><div class="assistant-msg assistant">你好，我可以解答平台问题，也可以在 Agent 模式下调整参数并规划实验。</div></div>
+      <div class="assistant-messages" id="assistantMessages"><div class="assistant-msg assistant">你好，我是 M豆，可以解答平台问题；切换到 Agent 模式后，还能帮你调整参数并规划实验。</div></div>
       <form class="assistant-compose" id="assistantForm">
         <textarea id="assistantInput" rows="1" placeholder="询问平台用法或参数..."></textarea>
         <button class="btn primary assistant-send" id="assistantSendBtn" type="submit">发送</button>

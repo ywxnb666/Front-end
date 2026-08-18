@@ -40,6 +40,7 @@ class AgentTests(unittest.TestCase):
 
     def test_product_knowledge_is_shared_by_ask_and_agent(self) -> None:
         for prompt in (ASK_SYSTEM_PROMPT, AGENT_SYSTEM_PROMPT):
+            self.assertIn("M豆", prompt)
             self.assertIn('左侧栏的“历史测评数据”区域', prompt)
             self.assertIn("~/.remote-clone-tool/history/", prompt)
             self.assertIn("不要建议用户在笔记本上直接打开服务器路径", prompt)
